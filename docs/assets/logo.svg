@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" fill="none">
+  <!-- Lupus — geometric wolf -->
+  <!-- Left ear -->
+  <polygon points="20,45 32,25 44,45" fill="#dc2626"/>
+  <!-- Right ear -->
+  <polygon points="70,45 82,25 94,45" fill="#dc2626"/>
+  <!-- Head -->
+  <polygon points="22,48 38,38 38,52 52,58 66,52 66,38 92,48 82,80 68,80 52,65 42,80 32,80" fill="#dc2626"/>
+  <!-- Eyes -->
+  <circle cx="42" cy="52" r="3.5" fill="#fca5a5"/>
+  <circle cx="72" cy="52" r="3.5" fill="#fca5a5"/>
+  <circle cx="43" cy="52" r="1.5" fill="#7f1d1d"/>
+  <circle cx="73" cy="52" r="1.5" fill="#7f1d1d"/>
+  <!-- Nose -->
+  <ellipse cx="57" cy="59" rx="3" ry="2" fill="#7f1d1d"/>
+  <!-- Teeth -->
+  <polygon points="40,66 48,66 44,72" fill="#fca5a5"/>
+  <polygon points="48,66 56,66 52,72" fill="#fca5a5"/>
+  <polygon points="56,66 64,66 60,72" fill="#fca5a5"/>
+  <polygon points="64,66 74,66 70,72" fill="#fca5a5"/>
+</svg>
