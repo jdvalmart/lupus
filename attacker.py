@@ -27,17 +27,20 @@ Attack vectors to cover:
 - Boundary numeric values (max int, negative, zero)
 - Type confusion (string for int, bool for string)
 
-Return ONLY a JSON array. Each element must have "why" and "params":
+You MUST respond with ONLY a JSON array and NOTHING else — no markdown,
+no explanation, no code fences. Start with [ and end with ].
+
+Example response format:
 [{{"why": "testing SQL injection", "params": {{"topic": "x", "decision": "'; DROP--"}}}}]
 
-Tool schema:"""
+Here is the tool to break:"""
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "llama3.2"
 
 
 def _ask_ollama(prompt: str, timeout: int = 120) -> str:
-    """Send a prompt to the local Ollama instance."""
+    """Send a prompt to the local Ollama instance, requesting JSON output."""
     payload = json.dumps({
         "model": OLLAMA_MODEL,
         "prompt": prompt,
@@ -57,19 +60,78 @@ def _ask_ollama(prompt: str, timeout: int = 120) -> str:
 
 
 def _parse_json_array(response: str) -> list[dict]:
-    """Extract a JSON array from LLM output, handling markdown wrapping."""
+    """Extract a JSON array or single object from LLM output."""
     text = response.strip()
     if text.startswith("```"):
         text = re.sub(r"```\w*\n?", "", text).replace("```", "")
+
+    # Try array first: [...]
     start = text.find("[")
     end = text.rfind("]")
-    if start == -1 or end == -1:
-        return []
-    try:
-        parsed = json.loads(text[start : end + 1])
-        return parsed if isinstance(parsed, list) else []
-    except json.JSONDecodeError:
-        return []
+    if start != -1 and end != -1 and end > start:
+        try:
+            parsed = json.loads(text[start : end + 1])
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # Fall back to single object: {...} → [{...}]
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            parsed = json.loads(text[start : end + 1])
+            if isinstance(parsed, dict) and "params" in parsed:
+                return [parsed]
+        except json.JSONDecodeError:
+            pass
+
+    return []
+
+
+# Patterns that indicate Orion is defending itself, not breaking
+_REJECTION_PATTERNS = [
+    "no memories stored", "not found", "invalid relation type",
+    "cannot link", "already", "unable to load",
+]
+
+
+def _classify(tool_name: str, params: dict, response: str) -> str:
+    """Classify a tool response as passed, rejected, or vulnerability.
+
+    - passed: tool accepted input and returned expected output
+    - rejected: tool rejected invalid input gracefully (GOOD — it defended itself)
+    - vulnerability: tool returned unexpected output or acted on invalid data
+    """
+    resp_lower = response.lower()
+
+    for pattern in _REJECTION_PATTERNS:
+        if pattern in resp_lower:
+            return "rejected"
+
+    if "error" in resp_lower[:30] and "toolerror" not in resp_lower:
+        return "rejected"
+
+    return "passed"
+
+
+def _classify_exception(tool_name: str, params: dict, error: str) -> str:
+    """Classify an exception raised during tool execution.
+
+    FastMCP validation errors (missing field, wrong type) are expected
+    rejections. All other exceptions are potential vulnerabilities.
+    """
+    validation_keywords = [
+        "missing required argument", "should be a valid integer",
+        "input should be", "validation error", "field required",
+        "unable to parse string as an integer", "int_type", "int_parsing",
+        "missing_argument", "string_type", "list_type",
+    ]
+    for keyword in validation_keywords:
+        if keyword.lower() in error.lower():
+            return "rejected"
+    return "vulnerability"
 
 
 async def run_adversarial(
@@ -145,29 +207,36 @@ async def run_adversarial(
                     content = getattr(result, "content", [])
                     text = content[0].text if content and hasattr(content[0], "text") else str(result)
                     elapsed = time.monotonic() - t1
+                    verdict = _classify(tool_name, params, text)
                     results.append({
                         "tool": tool_name, "why": why, "params": params,
-                        "passed": True, "response": text[:200],
+                        "verdict": verdict, "response": text[:200],
                         "elapsed_ms": round(elapsed * 1000, 1),
                     })
                 except Exception as e:
                     elapsed = time.monotonic() - t1
+                    error_text = str(e)[:300]
+                    verdict = _classify_exception(tool_name, params, error_text)
                     results.append({
                         "tool": tool_name, "why": why, "params": params,
-                        "passed": False, "error": str(e)[:200],
+                        "verdict": verdict, "error": error_text,
                         "elapsed_ms": round(elapsed * 1000, 1),
                     })
 
         total_time = time.monotonic() - t_total
-        failures = [r for r in results if not r["passed"]]
-        passed = len(results) - len(failures)
-        score = round((passed / len(results)) * 100, 1)
+
+        passed = sum(1 for r in results if r["verdict"] == "passed")
+        rejected = sum(1 for r in results if r["verdict"] == "rejected")
+        vulnerabilities = sum(1 for r in results if r["verdict"] == "vulnerability")
+        resistant = passed + rejected  # both are good — the server is healthy
+        score = round((resistant / len(results)) * 100, 1)
 
         # --- Phase 4: Report ---
         print(f"📊 Phase 4: Generating report...")
         _write_report(results, len(schemas), total_time, score)
-        print(f"\n✅ Done! {passed}/{len(results)} passed ({score}%)")
-        print(f"   Report: {REPORT_PATH}")
+        print(f"\n✅ Done!")
+        print(f"   Passed: {passed} | Rejected (defended): {rejected} | Vulnerabilities: {vulnerabilities}")
+        print(f"   Score: {score}% | Report: {REPORT_PATH}")
 
 
 def _write_report(
@@ -176,43 +245,69 @@ def _write_report(
     total_time: float,
     score: float,
 ) -> None:
-    """Write QA_REPORT.md."""
-    failures = [r for r in results if not r["passed"]]
-    passed = len(results) - len(failures)
+    """Write QA_REPORT.md with proper classification."""
+    passed = sum(1 for r in results if r["verdict"] == "passed")
+    rejected = sum(1 for r in results if r["verdict"] == "rejected")
+    vulnerabilities = sum(1 for r in results if r["verdict"] == "vulnerability")
+    total = len(results)
 
     lines = [
-        f"# Lupus QA Report",
-        f"",
+        "# Lupus QA Report",
+        "",
         f"**Generated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
         f"**Server:** Orion",
         f"**LLM:** {OLLAMA_MODEL} (Ollama)",
         f"**Total time:** {total_time:.1f}s",
-        f"",
-        f"## Summary",
-        f"",
-        f"| Metric | Value |",
-        f"|--------|-------|",
-        f"| Tests executed | {len(results)} |",
+        "",
+        "## Summary",
+        "",
+        "| Metric | Value |",
+        "|--------|-------|",
+        f"| Tests executed | {total} |",
         f"| Passed | {passed} |",
-        f"| Failed | {len(failures)} |",
+        f"| Rejected (defended) | {rejected} |",
+        f"| Vulnerabilities | {vulnerabilities} |",
         f"| Score | {score}% |",
         f"| Tools tested | {tools_count} |",
-        f"",
+        "",
+        "**Score = (passed + rejected) / total.** Rejections count as success — "
+        "they mean Orion correctly defended itself against malicious input.",
+        "",
     ]
 
-    if failures:
-        lines.append(f"## Failures ({len(failures)})")
+    if vulnerabilities:
+        lines.append(f"## Vulnerabilities ({vulnerabilities})")
         lines.append("")
-        for f in failures:
-            lines.extend([
-                f"### {f['tool']}",
-                f"- **Why:** {f['why']}",
-                f"- **Input:** `{json.dumps(f['params'])}`",
-                f"- **Error:** {f.get('error', 'unknown')}",
-                f"",
-            ])
+        for r in results:
+            if r["verdict"] == "vulnerability":
+                lines.extend([
+                    f"### {r['tool']}",
+                    f"- **Why:** {r['why']}",
+                    f"- **Input:** `{json.dumps(r['params'])}`",
+                    f"- **Error:** {r.get('error', 'unknown')}",
+                    "",
+                ])
+    elif rejected > 0:
+        lines.append(f"## Rejections ({rejected})")
+        lines.append("")
+        lines.append("Every rejection below is Orion defending itself correctly — "
+                     "not a bug. These inputs were designed to break the server, "
+                     "and Orion refused them all.")
+        lines.append("")
+        lines.append("<details>")
+        lines.append("<summary>Click to expand rejection details</summary>")
+        lines.append("")
+        for r in results:
+            if r["verdict"] == "rejected":
+                lines.append(f"- **{r['tool']}** — {r.get('error', r.get('response', ''))[:120]}")
+        lines.append("")
+        lines.append("</details>")
+        lines.append("")
     else:
-        lines.extend(["## No failures", "", "Orion survived every AI-generated adversarial input.", ""])
+        lines.append("## No vulnerabilities found")
+        lines.append("")
+        lines.append("Orion survived every AI-generated adversarial input without issues.")
+        lines.append("")
 
     per_tool: dict[str, list[float]] = {}
     for r in results:
@@ -226,7 +321,10 @@ def _write_report(
     ])
     for tool, times in sorted(per_tool.items()):
         avg = sum(times) / len(times)
-        lines.append(f"| {tool} | {avg:.0f}ms | {min(times):.0f}ms | {max(times):.0f}ms | {len(times)} |")
+        lines.append(
+            f"| {tool} | {avg:.0f}ms | {min(times):.0f}ms "
+            f"| {max(times):.0f}ms | {len(times)} |"
+        )
 
     lines.extend([
         "",

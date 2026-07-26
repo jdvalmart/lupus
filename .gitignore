@@ -9,6 +9,10 @@ venv/
 .vscode/
 .idea/
 
+# Generated report
+QA_REPORT.md
+
 # OS
 .DS_Store
 Thumbs.db
+
