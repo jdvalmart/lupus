@@ -1,0 +1,29 @@
+[project]
+name = "lupus"
+version = "0.1.0"
+description = "Test suite for the universo MCP ecosystem — protocol, functional, contracts, persistence, and performance testing."
+requires-python = ">=3.11"
+
+[project.scripts]
+lupus = "lupus_cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "fastmcp>=2.0.0",
+    "pyyaml>=6.0",
+    "pydantic>=2.0.0",
+]
+
+[tool.pytest.ini_options]
+# Look for tests in all test_* directories and test_shared/
+testpaths = ["."]
+asyncio_mode = "auto"
+markers = [
+    "protocol: MCP protocol compliance tests",
+    "functional: Tool functionality tests",
+    "contracts: Edge case and invalid input tests",
+    "persistence: File corruption and recovery tests",
+    "performance: Load, concurrency, and response time tests",
+]

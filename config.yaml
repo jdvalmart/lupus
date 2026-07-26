@@ -1,0 +1,25 @@
+# Lupus — Server Registry
+#
+# Each server under test needs a name, transport URL, and its expected
+# tool names. Lupus uses this to auto-discover what to test.
+#
+# The `tools` list is optional. If present, Lupus validates that every
+# listed tool exists. If absent, Lupus skips the tool-existence check
+# for that server but still runs protocol and compliance tests.
+
+servers:
+  orion:
+    url: "http://localhost:9099/mcp"
+    tools:
+      - remember_decision
+      - recall_context
+      - revise_decision
+      - forget_decision
+      - browse_memories
+      - whoami
+      - link_concepts
+      - find_related
+      - browse_graph
+      - remember_session
+      - recall_session
+      - browse_sessions
