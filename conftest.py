@@ -139,3 +139,37 @@ def ollama():
             return f"OLLAMA_ERROR: {e}"
 
     return ask
+
+
+@pytest.fixture
+def llm_data(ollama):
+    """Generate realistic test data via local LLM.
+
+    Returns a callable that generates data from a prompt.
+    Falls back to a default value if Ollama is unavailable or slow.
+    """
+
+    def generate(prompt: str, fallback: str = "test_data", timeout: int = 10) -> str:
+        """Generate data via LLM with automatic fallback.
+
+        Args:
+            prompt: Instruction for the LLM.
+            fallback: Value to use if LLM fails.
+            timeout: Max seconds to wait for LLM response.
+
+        Returns:
+            LLM-generated string or fallback value.
+        """
+        try:
+            resp = ollama(
+                f"Respond ONLY with the requested data, nothing else. No quotes, no explanation: {prompt}",
+                timeout=timeout,
+            )
+            if resp and "OLLAMA_ERROR" not in resp:
+                cleaned = resp.strip().strip('"').strip("'")
+                return cleaned[:200] if cleaned else fallback
+            return fallback
+        except Exception:
+            return fallback
+
+    return generate
