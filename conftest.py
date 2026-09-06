@@ -1,6 +1,7 @@
 """Shared fixtures for Lupus — MCP client, clean data, server helpers."""
 
 import json
+import time
 import urllib.request
 from pathlib import Path
 
@@ -9,6 +10,8 @@ import yaml
 from fastmcp import Client
 
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
+_run_start_time: float = 0.0
+_test_results: list[dict] = []
 
 
 def pytest_addoption(parser):
@@ -173,3 +176,60 @@ def llm_data(ollama):
             return fallback
 
     return generate
+
+
+# ---------------------------------------------------------------------------
+# Report generation — pytest hooks
+# ---------------------------------------------------------------------------
+
+def pytest_sessionstart(session):
+    """Record the start time of the test session."""
+    global _run_start_time
+    _run_start_time = time.monotonic()
+
+
+def pytest_runtest_logreport(report):
+    """Collect test results as they complete."""
+    if report.when == "call" or report.when == "setup" and report.outcome == "error":
+        layer = "unknown"
+        for mark in report.keywords:
+            if mark in ("protocol", "functional", "contracts", "persistence", "performance"):
+                layer = mark
+                break
+
+        # Detect LLM usage from fixtures
+        llm_used = False
+        if hasattr(report, "funcargs") and "llm_data" in report.funcargs:
+            llm_used = True
+        if hasattr(report, "funcargs") and "ollama" in report.funcargs:
+            llm_used = True
+
+        duration = report.duration
+        outcome = report.outcome  # passed, failed, skipped
+        error = ""
+        if report.longreprtext:
+            error = report.longreprtext[:500]
+
+        _test_results.append({
+            "name": report.nodeid,
+            "outcome": outcome,
+            "duration": duration,
+            "layer": layer,
+            "error": error,
+            "llm_used": llm_used,
+        })
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Generate the test dossier at the end of the session."""
+    from report import generate_report
+
+    global _test_results
+    total_time = time.monotonic() - _run_start_time
+    any_llm = any(r.get("llm_used") for r in _test_results)
+
+    if _test_results:
+        report_path = generate_report(_test_results, total_time, llm_used=any_llm)
+        print(f"\n  Test dossier: {report_path}")
+
+    _test_results = []
