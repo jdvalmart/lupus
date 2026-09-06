@@ -1,4 +1,4 @@
-"""Adversarial attack module — uses Ollama to generate inputs that break Orion.
+"""Adversarial attack module — uses Ollama + fallback attacks to break Orion.
 
 Runs independently from pytest. Called by `lupus attack`.
 """
@@ -16,27 +16,130 @@ from fastmcp import Client
 REPORT_PATH = Path(__file__).parent / "QA_REPORT.md"
 CONFIG_PATH = Path(__file__).parent / "config.yaml"
 
-ATTACK_PROMPT = """You are a QA engineer specialized in adversarial testing.
-Generate exactly {count} test inputs designed to break this MCP server tool.
+ATTACK_PROMPT = """You are a QA security engineer. Generate exactly {count} DIFFERENT malicious test inputs for this MCP tool.
 
-Attack vectors to cover:
-- Empty strings, missing required parameters, None/null
-- SQL injection patterns, path traversal (../../etc/passwd)
-- JSON injection, extremely long strings (5000+ chars)
-- Unicode edge cases (emojis, RTL, zero-width chars)
-- Boundary numeric values (max int, negative, zero)
-- Type confusion (string for int, bool for string)
+Each input must target a DIFFERENT attack vector:
+1. Empty/missing required fields
+2. SQL injection (e.g., '; DROP TABLE--)
+3. Path traversal (e.g., ../../etc/passwd)
+4. XSS/HTML injection (e.g., <script>alert(1)</script>)
+5. Unicode abuse (emojis, RTL override, zero-width chars)
+5. Extremely long strings (10000+ chars)
+6. Boundary numbers (0, -1, MAX_INT=999999999, float 0.001)
+7. Type confusion (string where int expected, bool where string expected)
+8. JSON injection (nested objects, arrays)
+9. Null bytes and control characters
 
-You MUST respond with ONLY a JSON array and NOTHING else — no markdown,
-no explanation, no code fences. Start with [ and end with ].
+RESPOND WITH ONLY A JSON ARRAY. No markdown, no explanation, no code fences.
+Each item: {{"why": "description", "params": {{"field": "value"}}}}
 
-Example response format:
-[{{"why": "testing SQL injection", "params": {{"topic": "x", "decision": "'; DROP--"}}}}]
+Example:
+[{{"why": "SQL injection in topic", "params": {{"topic": "'; DROP TABLE decisions; --", "decision": "test"}}}}]
 
-Here is the tool to break:"""
+Tool schema:"""
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "llama3.2"
+
+
+# ---------------------------------------------------------------------------
+# Fallback attack vectors — pre-built when LLM fails or generates too few
+# ---------------------------------------------------------------------------
+
+_FALLBACK_ATTACKS: dict[str, list[dict]] = {
+    "remember_decision": [
+        {"why": "empty topic and decision", "params": {"topic": "", "decision": ""}},
+        {"why": "SQL injection in topic", "params": {"topic": "'; DROP TABLE decisions; --", "decision": "test"}},
+        {"why": "path traversal", "params": {"topic": "../../etc/passwd", "decision": "test"}},
+        {"why": "XSS in decision", "params": {"topic": "test", "decision": "<script>alert(1)</script>"}},
+        {"why": "extremely long topic", "params": {"topic": "A" * 10000, "decision": "test"}},
+        {"why": "unicode bombs", "params": {"topic": "‮؜‎test‏", "decision": "🔥💀☠️"}},
+        {"why": "null bytes", "params": {"topic": "test\x00injection", "decision": "test"}},
+        {"why": "negative ID abuse", "params": {"topic": "-999999", "decision": "test"}},
+        {"why": "float as string", "params": {"topic": "0.000001", "decision": "0.999999"}},
+        {"why": "nested JSON", "params": {"topic": "{{\"key\": \"val\"}}", "decision": "[1,2,3]"}},
+    ],
+    "recall_context": [
+        {"why": "empty query", "params": {"query": ""}},
+        {"why": "SQL injection", "params": {"query": "'; SELECT * FROM--"}},
+        {"why": "very long query", "params": {"query": "A" * 10000}},
+        {"why": "unicode query", "params": {"query": "‮test‏"}},
+        {"why": "negative limit", "params": {"query": "test", "limit": -1}},
+        {"why": "float limit", "params": {"query": "test", "limit": 0.5}},
+        {"why": "string limit", "params": {"query": "test", "limit": "abc"}},
+        {"why": "null query", "params": {"query": None}},
+    ],
+    "revise_decision": [
+        {"why": "non-existent ID", "params": {"id": 99999, "topic": "ghost"}},
+        {"why": "negative ID", "params": {"id": -1, "topic": "test"}},
+        {"why": "zero ID", "params": {"id": 0, "topic": "test"}},
+        {"why": "float ID", "params": {"id": 0.5, "topic": "test"}},
+        {"why": "string ID", "params": {"id": "abc", "topic": "test"}},
+        {"why": "missing ID", "params": {"topic": "test"}},
+        {"why": "null topic", "params": {"id": 1, "topic": None}},
+    ],
+    "forget_decision": [
+        {"why": "non-existent ID", "params": {"id": 99999}},
+        {"why": "negative ID", "params": {"id": -1}},
+        {"why": "zero ID", "params": {"id": 0}},
+        {"why": "float ID", "params": {"id": 0.5}},
+        {"why": "string ID", "params": {"id": "abc"}},
+        {"why": "null ID", "params": {"id": None}},
+    ],
+    "link_concepts": [
+        {"why": "missing all params", "params": {}},
+        {"why": "non-existent source", "params": {"source_id": 99999, "target_id": 1, "relation": "depends_on"}},
+        {"why": "non-existent target", "params": {"source_id": 1, "target_id": 99999, "relation": "depends_on"}},
+        {"why": "invalid relation", "params": {"source_id": 1, "target_id": 2, "relation": "eats_pizza"}},
+        {"why": "self link", "params": {"source_id": 1, "target_id": 1, "relation": "depends_on"}},
+        {"why": "negative IDs", "params": {"source_id": -1, "target_id": -2, "relation": "depends_on"}},
+        {"why": "string IDs", "params": {"source_id": "abc", "target_id": "def", "relation": "depends_on"}},
+    ],
+    "find_related": [
+        {"why": "missing ID", "params": {}},
+        {"why": "non-existent ID", "params": {"id": 99999}},
+        {"why": "negative ID", "params": {"id": -1}},
+        {"why": "zero ID", "params": {"id": 0}},
+        {"why": "string ID", "params": {"id": "abc"}},
+        {"why": "float ID", "params": {"id": 0.5}},
+    ],
+    "browse_memories": [
+        {"why": "with extra params", "params": {"hack": "true"}},
+        {"why": "null params", "params": {"limit": None}},
+    ],
+    "browse_graph": [
+        {"why": "with extra params", "params": {"hack": "true"}},
+    ],
+    "whoami": [
+        {"why": "with malicious params", "params": {"inject": "<script>alert(1)</script>"}},
+        {"why": "with extra params", "params": {"admin": "true"}},
+    ],
+    "remember_session": [
+        {"why": "empty summary", "params": {"summary": ""}},
+        {"why": "SQL injection", "params": {"summary": "'; DROP TABLE sessions; --"}},
+        {"why": "very long summary", "params": {"summary": "A" * 10000}},
+        {"why": "unicode", "params": {"summary": "‮test‏"}},
+        {"why": "missing summary", "params": {}},
+        {"why": "null summary", "params": {"summary": None}},
+    ],
+    "recall_session": [
+        {"why": "with extra params", "params": {"hack": "true"}},
+    ],
+    "browse_sessions": [
+        {"why": "with extra params", "params": {"hack": "true"}},
+    ],
+    "backup_to_s3": [
+        {"why": "missing bucket", "params": {}},
+        {"why": "empty bucket", "params": {"bucket": ""}},
+        {"why": "SQL injection", "params": {"bucket": "'; DROP--"}},
+        {"why": "path traversal", "params": {"bucket": "../../etc/passwd"}},
+    ],
+    "restore_from_s3": [
+        {"why": "missing bucket", "params": {}},
+        {"why": "empty bucket", "params": {"bucket": ""}},
+        {"why": "SQL injection", "params": {"bucket": "'; DROP--"}},
+    ],
+}
 
 
 def _ask_ollama(prompt: str, timeout: int = 120) -> str:
@@ -142,7 +245,7 @@ async def run_adversarial(
     """Run the full adversarial testing pipeline.
 
     Args:
-        count: Number of inputs per tool.
+        count: Number of inputs per tool (LLM-generated).
         tools: Specific tool names to test (None = all).
         server_url: MCP server endpoint.
     """
@@ -173,23 +276,40 @@ async def run_adversarial(
 
         print(f"   Found {len(schemas)} tool(s) to attack")
 
-        # --- Phase 2: Generation ---
-        print(f"🧠 Phase 2: Generating {count} adversarial inputs per tool via {OLLAMA_MODEL}...")
+        # --- Phase 2: Generation (LLM + Fallback) ---
+        print(f"🧠 Phase 2: Generating adversarial inputs via {OLLAMA_MODEL} + fallback attacks...")
         generated: dict[str, list[dict]] = {}
         prompt = ATTACK_PROMPT.replace("{count}", str(count))
 
         for i, (name, schema) in enumerate(schemas.items(), 1):
             print(f"   [{i}/{len(schemas)}] {name}...", end=" ", flush=True)
+
+            # LLM generation
+            llm_cases: list[dict] = []
             response = _ask_ollama(f"{prompt}\n{json.dumps(schema, indent=2)}")
-            cases = _parse_json_array(response)
-            generated[name] = cases if cases else [
-                {"why": "LLM output could not be parsed", "params": {}}
+            llm_cases = _parse_json_array(response)
+
+            # Fallback attacks
+            fallback_cases = _FALLBACK_ATTACKS.get(name, [])
+
+            # Merge: LLM + fallback (deduplicate by params)
+            all_cases: list[dict] = []
+            seen_params: set[str] = set()
+
+            for case in fallback_cases + llm_cases:
+                params_key = json.dumps(case.get("params", {}), sort_keys=True)
+                if params_key not in seen_params:
+                    seen_params.add(params_key)
+                    all_cases.append(case)
+
+            generated[name] = all_cases if all_cases else [
+                {"why": "no attacks generated", "params": {}}
             ]
-            print(f"{len(generated[name])} inputs")
+            print(f"{len(generated[name])} inputs (LLM: {len(llm_cases)}, fallback: {len(fallback_cases)})")
 
         total_gen = sum(len(v) for v in generated.values())
         if total_gen == 0:
-            print("❌ LLM generated 0 test cases. Is Ollama running?")
+            print("❌ No attack cases generated. Check Ollama and fallback data.")
             return
 
         # --- Phase 3: Execution ---
@@ -256,7 +376,7 @@ def _write_report(
         "",
         f"**Generated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
         f"**Server:** Orion",
-        f"**LLM:** {OLLAMA_MODEL} (Ollama)",
+        f"**LLM:** {OLLAMA_MODEL} (Ollama) + fallback attacks",
         f"**Total time:** {total_time:.1f}s",
         "",
         "## Summary",
@@ -306,7 +426,7 @@ def _write_report(
     else:
         lines.append("## No vulnerabilities found")
         lines.append("")
-        lines.append("Orion survived every AI-generated adversarial input without issues.")
+        lines.append("Orion survived every adversarial input without issues.")
         lines.append("")
 
     per_tool: dict[str, list[float]] = {}
