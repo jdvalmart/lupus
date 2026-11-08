@@ -1,47 +1,40 @@
-"""Layer 1 — MCP Protocol Compliance.
+"""Layer 1 — MCP protocol compliance and transport security at the wire level."""
 
-Tests that verify the server speaks MCP correctly at the wire level,
-including Streamable HTTP session negotiation requirements.
-"""
+from __future__ import annotations
 
 import pytest
 
 
 @pytest.mark.protocol
 class TestProtocol:
-    """Raw protocol tests — verify JSON-RPC and session behavior."""
+    """Raw JSON-RPC over Streamable HTTP, without a negotiated session."""
 
-    def test_jsonrpc_version_on_sessionless_request(self, raw):
-        """Without a session, the server still responds with valid JSON-RPC."""
-        resp = raw("tools/list")
-        assert resp.get("jsonrpc") == "2.0", f"Expected jsonrpc 2.0, got: {resp}"
+    def test_sessionless_request_gets_jsonrpc_error(self, raw):
+        """Streamable HTTP requires initialize first; the reply is still valid JSON-RPC."""
+        _, body = raw("tools/list")
+        assert body.get("jsonrpc") == "2.0", body
+        assert "error" in body, body
+        assert {"code", "message"} <= set(body["error"]), body
 
-    def test_missing_session_is_rejected_with_error(self, raw):
-        """Streamable HTTP requires a session ID. Without it, we get an error."""
-        resp = raw("tools/list")
-        assert "error" in resp, (
-            f"Sessionless request should return an error, got: {resp}"
-        )
+    def test_unknown_method_returns_standard_error_code(self, raw):
+        """Unknown methods fail with -32601, or -32600 when the session check runs first."""
+        _, body = raw("tools/eat_pizza")
+        assert body["error"]["code"] in (-32601, -32600), body
 
-    def test_invalid_method_returns_error_code(self, raw):
-        """Unknown methods must return an error code.
 
-        Streamable HTTP may reject the request with a session error (-32600)
-        before checking the method, which is also valid behavior.
-        """
-        resp = raw("tools/eat_pizza")
-        assert "error" in resp, f"Expected error response: {resp}"
-        code = resp["error"]["code"]
-        assert code == -32601 or code == -32600, (
-            f"Expected -32601 (method not found) or -32600 (session required), got {code}"
-        )
+@pytest.mark.protocol
+class TestAuthentication:
+    """A managed server always runs with a bearer token."""
 
-    def test_error_response_has_code_and_message(self, raw):
-        """All error responses must include code and message fields."""
-        resp = raw("tools/call", {
-            "name": "nonexistent_tool_xyz",
-            "arguments": {},
-        })
-        if "error" in resp:
-            assert "code" in resp["error"], f"Error missing code: {resp}"
-            assert "message" in resp["error"], f"Error missing message: {resp}"
+    def test_missing_token_is_rejected(self, raw, requires_managed):
+        status, _ = raw("tools/list", headers={})
+        assert status == 401
+
+    def test_wrong_token_is_rejected(self, raw, requires_managed):
+        status, _ = raw("tools/list", headers={"Authorization": "Bearer not-the-token"})
+        assert status == 401
+
+    def test_valid_token_reaches_mcp_layer(self, raw, requires_managed):
+        status, body = raw("tools/list")
+        assert status != 401
+        assert body.get("jsonrpc") == "2.0"

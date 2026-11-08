@@ -1,457 +1,450 @@
-"""Adversarial attack module — uses Ollama + fallback attacks to break Orion.
+"""Adversarial testing — hostile inputs from a local LLM (Ollama) plus a built-in corpus.
 
-Runs independently from pytest. Called by `lupus attack`.
+Runs outside pytest via ``lupus attack``, always against an isolated server
+instance (see lupus_server.py). Each response is classified:
+
+- accepted       the tool succeeded (hostile text stored verbatim is fine)
+- rejected       the tool returned a tool error — the server defended itself
+- slow           answered, but slower than SLOW_SECONDS (warning)
+- vulnerability  server crashed, protocol/transport failure, internal details
+                 leaked in the response, or the store failed its integrity check
+
+Score = cases without a vulnerability / total cases.
 """
 
+from __future__ import annotations
+
 import json
+import os
 import re
 import time
+import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
-import yaml
 from fastmcp import Client
 
+from lupus_server import Server, server_from_config
+from report import bar, score_line
+
 REPORT_PATH = Path(__file__).parent / "QA_REPORT.md"
-CONFIG_PATH = Path(__file__).parent / "config.yaml"
+OLLAMA_URL = os.environ.get("LUPUS_OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.environ.get("LUPUS_OLLAMA_MODEL", "llama3.2")
+SLOW_SECONDS = 3.0
 
-ATTACK_PROMPT = """You are a QA security engineer. Generate exactly {count} DIFFERENT malicious test inputs for this MCP tool.
+ATTACK_PROMPT = """You are a QA security engineer. Generate exactly {count} DIFFERENT malicious \
+test inputs for this MCP tool, each targeting a different attack vector:
+empty or missing fields; SQL injection; path traversal; HTML/script injection; Unicode abuse \
+(RTL override, zero-width chars, emojis); extremely long strings; boundary numbers \
+(0, -1, 2147483648, 0.001); type confusion; nested JSON; null bytes and control characters.
 
-Each input must target a DIFFERENT attack vector:
-1. Empty/missing required fields
-2. SQL injection (e.g., '; DROP TABLE--)
-3. Path traversal (e.g., ../../etc/passwd)
-4. XSS/HTML injection (e.g., <script>alert(1)</script>)
-5. Unicode abuse (emojis, RTL override, zero-width chars)
-5. Extremely long strings (10000+ chars)
-6. Boundary numbers (0, -1, MAX_INT=999999999, float 0.001)
-7. Type confusion (string where int expected, bool where string expected)
-8. JSON injection (nested objects, arrays)
-9. Null bytes and control characters
-
-RESPOND WITH ONLY A JSON ARRAY. No markdown, no explanation, no code fences.
+RESPOND WITH ONLY A JSON ARRAY. No markdown, no explanation.
 Each item: {{"why": "description", "params": {{"field": "value"}}}}
 
-Example:
-[{{"why": "SQL injection in topic", "params": {{"topic": "'; DROP TABLE decisions; --", "decision": "test"}}}}]
+Tool schema:
+"""
 
-Tool schema:"""
+LEAK_PATTERNS = [
+    re.compile(p)
+    for p in (
+        r"Traceback \(most recent call last\)",
+        r'File "/',
+        r"/home/[\w.-]+/",
+        r"site-packages",
+        r"sqlite3\.\w+Error",
+        r"OperationalError",
+    )
+]
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "llama3.2"
+_LONG = "A" * 10_000
+_BIDI = "‮؜‎test‏"
 
-
-# ---------------------------------------------------------------------------
-# Fallback attack vectors — pre-built when LLM fails or generates too few
-# ---------------------------------------------------------------------------
-
-_FALLBACK_ATTACKS: dict[str, list[dict]] = {
+FALLBACK_ATTACKS: dict[str, list[dict[str, Any]]] = {
     "remember_decision": [
         {"why": "empty topic and decision", "params": {"topic": "", "decision": ""}},
-        {"why": "SQL injection in topic", "params": {"topic": "'; DROP TABLE decisions; --", "decision": "test"}},
-        {"why": "path traversal", "params": {"topic": "../../etc/passwd", "decision": "test"}},
-        {"why": "XSS in decision", "params": {"topic": "test", "decision": "<script>alert(1)</script>"}},
-        {"why": "extremely long topic", "params": {"topic": "A" * 10000, "decision": "test"}},
-        {"why": "unicode bombs", "params": {"topic": "‮؜‎test‏", "decision": "🔥💀☠️"}},
-        {"why": "null bytes", "params": {"topic": "test\x00injection", "decision": "test"}},
-        {"why": "negative ID abuse", "params": {"topic": "-999999", "decision": "test"}},
-        {"why": "float as string", "params": {"topic": "0.000001", "decision": "0.999999"}},
-        {"why": "nested JSON", "params": {"topic": "{{\"key\": \"val\"}}", "decision": "[1,2,3]"}},
+        {
+            "why": "SQL injection",
+            "params": {"topic": "'; DROP TABLE memories; --", "decision": "x"},
+        },
+        {"why": "path traversal", "params": {"topic": "../../etc/passwd", "decision": "x"}},
+        {
+            "why": "script injection",
+            "params": {"topic": "x", "decision": "<script>alert(1)</script>"},
+        },
+        {"why": "oversized topic", "params": {"topic": _LONG, "decision": "x"}},
+        {"why": "unicode bidi abuse", "params": {"topic": _BIDI, "decision": "🔥💀☠️"}},
+        {"why": "null byte", "params": {"topic": "test\x00injection", "decision": "x"}},
+        {"why": "tags as object", "params": {"topic": "x", "decision": "x", "tags": {"a": 1}}},
+        {
+            "why": "hostile project",
+            "params": {"topic": "x", "decision": "x", "project": "../../root"},
+        },
+        {"why": "supersedes unknown", "params": {"topic": "x", "decision": "x", "supersedes": -5}},
     ],
     "recall_context": [
         {"why": "empty query", "params": {"query": ""}},
-        {"why": "SQL injection", "params": {"query": "'; SELECT * FROM--"}},
-        {"why": "very long query", "params": {"query": "A" * 10000}},
-        {"why": "unicode query", "params": {"query": "‮test‏"}},
-        {"why": "negative limit", "params": {"query": "test", "limit": -1}},
-        {"why": "float limit", "params": {"query": "test", "limit": 0.5}},
-        {"why": "string limit", "params": {"query": "test", "limit": "abc"}},
+        {"why": "FTS5 syntax injection", "params": {"query": 'a" OR NEAR(b c) * ^ AND'}},
+        {"why": "SQL injection", "params": {"query": "'; SELECT * FROM memories --"}},
+        {"why": "oversized query", "params": {"query": _LONG}},
+        {"why": "negative limit", "params": {"query": "x", "limit": -1}},
+        {"why": "huge limit", "params": {"query": "x", "limit": 2_147_483_648}},
+        {"why": "string limit", "params": {"query": "x", "limit": "abc"}},
         {"why": "null query", "params": {"query": None}},
+        {"why": "invalid scope", "params": {"query": "x", "scope": "../../"}},
     ],
     "revise_decision": [
-        {"why": "non-existent ID", "params": {"id": 99999, "topic": "ghost"}},
-        {"why": "negative ID", "params": {"id": -1, "topic": "test"}},
-        {"why": "zero ID", "params": {"id": 0, "topic": "test"}},
-        {"why": "float ID", "params": {"id": 0.5, "topic": "test"}},
-        {"why": "string ID", "params": {"id": "abc", "topic": "test"}},
-        {"why": "missing ID", "params": {"topic": "test"}},
-        {"why": "null topic", "params": {"id": 1, "topic": None}},
+        {"why": "unknown id", "params": {"id": 99_999_999, "topic": "ghost"}},
+        {"why": "negative id", "params": {"id": -1, "topic": "x"}},
+        {"why": "float id", "params": {"id": 0.5, "topic": "x"}},
+        {"why": "missing id", "params": {"topic": "x"}},
+        {"why": "no fields", "params": {"id": 1}},
     ],
     "forget_decision": [
-        {"why": "non-existent ID", "params": {"id": 99999}},
-        {"why": "negative ID", "params": {"id": -1}},
-        {"why": "zero ID", "params": {"id": 0}},
-        {"why": "float ID", "params": {"id": 0.5}},
-        {"why": "string ID", "params": {"id": "abc"}},
-        {"why": "null ID", "params": {"id": None}},
-    ],
-    "link_concepts": [
-        {"why": "missing all params", "params": {}},
-        {"why": "non-existent source", "params": {"source_id": 99999, "target_id": 1, "relation": "depends_on"}},
-        {"why": "non-existent target", "params": {"source_id": 1, "target_id": 99999, "relation": "depends_on"}},
-        {"why": "invalid relation", "params": {"source_id": 1, "target_id": 2, "relation": "eats_pizza"}},
-        {"why": "self link", "params": {"source_id": 1, "target_id": 1, "relation": "depends_on"}},
-        {"why": "negative IDs", "params": {"source_id": -1, "target_id": -2, "relation": "depends_on"}},
-        {"why": "string IDs", "params": {"source_id": "abc", "target_id": "def", "relation": "depends_on"}},
-    ],
-    "find_related": [
-        {"why": "missing ID", "params": {}},
-        {"why": "non-existent ID", "params": {"id": 99999}},
-        {"why": "negative ID", "params": {"id": -1}},
-        {"why": "zero ID", "params": {"id": 0}},
-        {"why": "string ID", "params": {"id": "abc"}},
-        {"why": "float ID", "params": {"id": 0.5}},
+        {"why": "unknown id", "params": {"id": 99_999_999}},
+        {"why": "zero id", "params": {"id": 0}},
+        {"why": "string id", "params": {"id": "1 OR 1=1"}},
+        {"why": "null id", "params": {"id": None}},
     ],
     "browse_memories": [
-        {"why": "with extra params", "params": {"hack": "true"}},
-        {"why": "null params", "params": {"limit": None}},
+        {"why": "negative offset", "params": {"offset": -10}},
+        {"why": "huge limit", "params": {"limit": 1_000_000}},
+        {"why": "tag injection", "params": {"tag": "' OR '1'='1"}},
+        {"why": "unexpected argument", "params": {"admin": True}},
     ],
-    "browse_graph": [
-        {"why": "with extra params", "params": {"hack": "true"}},
+    "link_concepts": [
+        {"why": "missing params", "params": {}},
+        {
+            "why": "unknown ids",
+            "params": {"source_id": 99_999_998, "target_id": 99_999_999, "relation": "depends_on"},
+        },
+        {"why": "invalid relation", "params": {"source_id": 1, "target_id": 2, "relation": "owns"}},
+        {"why": "self link", "params": {"source_id": 1, "target_id": 1, "relation": "depends_on"}},
     ],
-    "whoami": [
-        {"why": "with malicious params", "params": {"inject": "<script>alert(1)</script>"}},
-        {"why": "with extra params", "params": {"admin": "true"}},
+    "find_related": [
+        {"why": "unknown id", "params": {"id": 99_999_999}},
+        {"why": "string id", "params": {"id": "abc"}},
     ],
+    "browse_graph": [{"why": "negative offset", "params": {"offset": -1}}],
     "remember_session": [
         {"why": "empty summary", "params": {"summary": ""}},
-        {"why": "SQL injection", "params": {"summary": "'; DROP TABLE sessions; --"}},
-        {"why": "very long summary", "params": {"summary": "A" * 10000}},
-        {"why": "unicode", "params": {"summary": "‮test‏"}},
-        {"why": "missing summary", "params": {}},
-        {"why": "null summary", "params": {"summary": None}},
+        {"why": "oversized summary", "params": {"summary": _LONG * 3}},
+        {
+            "why": "unknown decisions",
+            "params": {"summary": "x", "decisions_made": [-1, 99_999_999]},
+        },
+        {"why": "decisions as string", "params": {"summary": "x", "decisions_made": "1,2,3"}},
     ],
-    "recall_session": [
-        {"why": "with extra params", "params": {"hack": "true"}},
+    "recall_session": [{"why": "hostile project", "params": {"project": "/etc/passwd"}}],
+    "browse_sessions": [{"why": "zero limit", "params": {"limit": 0}}],
+    "list_projects": [{"why": "unexpected argument", "params": {"inject": "<script>"}}],
+    "whoami": [{"why": "unexpected argument", "params": {"admin": "true"}}],
+    "update_profile": [
+        {"why": "empty section", "params": {"section": "", "value": "x"}},
+        {"why": "remove unknown section", "params": {"section": "nope", "value": None}},
+        {"why": "oversized value", "params": {"section": "big", "value": _LONG * 10}},
+        {"why": "deeply nested value", "params": {"section": "deep", "value": [[[[[[[[1]]]]]]]]}},
     ],
-    "browse_sessions": [
-        {"why": "with extra params", "params": {"hack": "true"}},
-    ],
-    "backup_to_s3": [
-        {"why": "missing bucket", "params": {}},
-        {"why": "empty bucket", "params": {"bucket": ""}},
-        {"why": "SQL injection", "params": {"bucket": "'; DROP--"}},
-        {"why": "path traversal", "params": {"bucket": "../../etc/passwd"}},
-    ],
-    "restore_from_s3": [
-        {"why": "missing bucket", "params": {}},
-        {"why": "empty bucket", "params": {"bucket": ""}},
-        {"why": "SQL injection", "params": {"bucket": "'; DROP--"}},
-    ],
+    "orion_health": [{"why": "unexpected argument", "params": {"verbose": True}}],
 }
 
 
+# ---------------------------------------------------------------------------
+# LLM generation
+# ---------------------------------------------------------------------------
+
+
+def ollama_available() -> bool:
+    """Whether the Ollama API answers."""
+    try:
+        urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=2)
+        return True
+    except (urllib.error.URLError, ConnectionError, TimeoutError):
+        return False
+
+
 def _ask_ollama(prompt: str, timeout: int = 120) -> str:
-    """Send a prompt to the local Ollama instance, requesting JSON output."""
-    payload = json.dumps({
-        "model": OLLAMA_MODEL,
-        "prompt": prompt,
-        "stream": False,
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        OLLAMA_URL,
+    payload = json.dumps({"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}).encode()
+    request = urllib.request.Request(
+        f"{OLLAMA_URL}/api/generate",
         data=payload,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8")).get("response", "")
-    except Exception as e:
-        return f"OLLAMA_ERROR: {e}"
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8")).get("response", "")
+    except (urllib.error.URLError, ConnectionError, TimeoutError, ValueError):
+        return ""
 
 
-def _parse_json_array(response: str) -> list[dict]:
-    """Extract a JSON array or single object from LLM output."""
-    text = response.strip()
-    if text.startswith("```"):
-        text = re.sub(r"```\w*\n?", "", text).replace("```", "")
-
-    # Try array first: [...]
-    start = text.find("[")
-    end = text.rfind("]")
-    if start != -1 and end != -1 and end > start:
-        try:
-            parsed = json.loads(text[start : end + 1])
-            if isinstance(parsed, list):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-
-    # Fall back to single object: {...} → [{...}]
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        try:
-            parsed = json.loads(text[start : end + 1])
-            if isinstance(parsed, dict) and "params" in parsed:
-                return [parsed]
-        except json.JSONDecodeError:
-            pass
-
-    return []
-
-
-# Patterns that indicate Orion is defending itself, not breaking
-_REJECTION_PATTERNS = [
-    "no memories stored", "not found", "invalid relation type",
-    "cannot link", "already", "unable to load",
-]
-
-
-def _classify(tool_name: str, params: dict, response: str) -> str:
-    """Classify a tool response as passed, rejected, or vulnerability.
-
-    - passed: tool accepted input and returned expected output
-    - rejected: tool rejected invalid input gracefully (GOOD — it defended itself)
-    - vulnerability: tool returned unexpected output or acted on invalid data
-    """
-    resp_lower = response.lower()
-
-    for pattern in _REJECTION_PATTERNS:
-        if pattern in resp_lower:
-            return "rejected"
-
-    if "error" in resp_lower[:30] and "toolerror" not in resp_lower:
-        return "rejected"
-
-    return "passed"
-
-
-def _classify_exception(tool_name: str, params: dict, error: str) -> str:
-    """Classify an exception raised during tool execution.
-
-    FastMCP validation errors (missing field, wrong type) are expected
-    rejections. All other exceptions are potential vulnerabilities.
-    """
-    validation_keywords = [
-        "missing required argument", "should be a valid integer",
-        "input should be", "validation error", "field required",
-        "unable to parse string as an integer", "int_type", "int_parsing",
-        "missing_argument", "string_type", "list_type",
+def parse_cases(response: str) -> list[dict[str, Any]]:
+    """Extract well-formed ``{"why", "params": {...}}`` cases from LLM output."""
+    text = re.sub(r"```\w*", "", response.strip())
+    candidates: Any = []
+    for opener, closer in (("[", "]"), ("{", "}")):
+        start, end = text.find(opener), text.rfind(closer)
+        if start != -1 and end > start:
+            try:
+                candidates = json.loads(text[start : end + 1])
+                break
+            except json.JSONDecodeError:
+                continue
+    if isinstance(candidates, dict):
+        candidates = [candidates]
+    if not isinstance(candidates, list):
+        return []
+    return [
+        {"why": str(c.get("why", "llm case")), "params": c["params"]}
+        for c in candidates
+        if isinstance(c, dict) and isinstance(c.get("params"), dict)
     ]
-    for keyword in validation_keywords:
-        if keyword.lower() in error.lower():
-            return "rejected"
-    return "vulnerability"
+
+
+# ---------------------------------------------------------------------------
+# Classification
+# ---------------------------------------------------------------------------
+
+
+def find_leak(text: str) -> str | None:
+    """The first internal-detail pattern found in a response, if any."""
+    for pattern in LEAK_PATTERNS:
+        if pattern.search(text):
+            return pattern.pattern
+    return None
+
+
+def classify(is_error: bool, text: str, elapsed: float) -> tuple[str, str]:
+    """Verdict and reason for a response that came back."""
+    leak = find_leak(text)
+    if leak:
+        return "vulnerability", f"internal details leaked ({leak})"
+    if elapsed > SLOW_SECONDS:
+        return "slow", f"took {elapsed:.1f}s"
+    if is_error:
+        return "rejected", text.strip().splitlines()[0][:120] if text.strip() else "tool error"
+    return "accepted", ""
+
+
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
+
+
+async def _execute(server: Server, cases: dict[str, list[dict[str, Any]]]) -> list[dict]:
+    results: list[dict[str, Any]] = []
+    client = Client(server.url, auth=server.token)
+    await client.__aenter__()
+    try:
+        for tool, tool_cases in cases.items():
+            for case in tool_cases:
+                started = time.monotonic()
+                record: dict[str, Any] = {
+                    "tool": tool,
+                    "why": case["why"],
+                    "params": case["params"],
+                }
+                try:
+                    result = await client.call_tool(tool, case["params"], raise_on_error=False)
+                    text = "\n".join(getattr(b, "text", "") for b in result.content)
+                    elapsed = time.monotonic() - started
+                    verdict, reason = classify(result.is_error, text, elapsed)
+                    record.update(response=text[:200])
+                except Exception as exc:
+                    elapsed = time.monotonic() - started
+                    verdict, reason = "vulnerability", f"transport/protocol failure: {exc}"[:300]
+
+                if not server.alive():
+                    verdict, reason = "vulnerability", "server process crashed"
+                    await client.__aexit__(None, None, None)
+                    server.start()
+                    client = Client(server.url, auth=server.token)
+                    await client.__aenter__()
+
+                record.update(verdict=verdict, reason=reason, elapsed_ms=round(elapsed * 1000, 1))
+                results.append(record)
+
+        if "orion_health" in {t.name for t in await client.list_tools()}:
+            health = await client.call_tool("orion_health", {}, raise_on_error=False)
+            integrity = (health.structured_content or {}).get("integrity")
+            results.append(
+                {
+                    "tool": "orion_health",
+                    "why": "store integrity after the attack",
+                    "params": {},
+                    "verdict": "accepted" if integrity == "ok" else "vulnerability",
+                    "reason": "" if integrity == "ok" else f"integrity check: {integrity}",
+                    "elapsed_ms": 0.0,
+                }
+            )
+    finally:
+        await client.__aexit__(None, None, None)
+    return results
 
 
 async def run_adversarial(
-    count: int = 4,
-    tools: list[str] | None = None,
-    server_url: str = "http://localhost:9099/mcp",
+    count: int = 4, tools: list[str] | None = None, server_name: str = "orion"
+) -> float:
+    """Generate, execute and report adversarial cases. Returns the score."""
+    server = server_from_config(server_name)
+    if not server.managed:
+        raise SystemExit(
+            f"Refusing to attack '{server_name}': it is an external server with real data. "
+            "Configure a `command` so Lupus can launch an isolated instance."
+        )
+    started = time.monotonic()
+    server.start()
+    try:
+        async with Client(server.url, auth=server.token) as client:
+            listed = await client.list_tools()
+        schemas = {
+            t.name: {"name": t.name, "description": t.description, "inputSchema": t.input_schema}
+            for t in listed
+            if not tools or t.name in tools
+        }
+        print(f"🎯 {len(schemas)} tool(s) on isolated {server_name} at {server.url}")
+
+        use_llm = ollama_available()
+        print(
+            "🧠 Generating cases: built-in corpus"
+            + (f" + {OLLAMA_MODEL}" if use_llm else " only (Ollama not reachable)")
+        )
+        cases: dict[str, list[dict[str, Any]]] = {}
+        llm_total = 0
+        for name, schema in schemas.items():
+            llm_cases = (
+                parse_cases(
+                    _ask_ollama(ATTACK_PROMPT.format(count=count) + json.dumps(schema, indent=2))
+                )
+                if use_llm
+                else []
+            )
+            llm_total += len(llm_cases)
+            seen: set[str] = set()
+            merged = []
+            for case in FALLBACK_ATTACKS.get(name, []) + llm_cases:
+                key = json.dumps(case["params"], sort_keys=True, default=str)
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(case)
+            cases[name] = merged or [{"why": "no arguments", "params": {}}]
+
+        total = sum(len(c) for c in cases.values())
+        print(f"⚔️  Executing {total} cases…")
+        results = await _execute(server, cases)
+    finally:
+        server.cleanup()
+
+    vulnerabilities = sum(r["verdict"] == "vulnerability" for r in results)
+    score = round((len(results) - vulnerabilities) / len(results) * 100, 1) if results else 0.0
+    llm_label = (
+        f"{OLLAMA_MODEL} ({llm_total} cases)" if use_llm else "not used (Ollama unreachable)"
+    )
+    write_report(results, server_name, llm_label, time.monotonic() - started, score)
+
+    counts = {
+        v: sum(r["verdict"] == v for r in results)
+        for v in ("accepted", "rejected", "slow", "vulnerability")
+    }
+    print(
+        f"✅ Done. Accepted {counts['accepted']} · Rejected {counts['rejected']} · "
+        f"Slow {counts['slow']} · Vulnerabilities {counts['vulnerability']}"
+    )
+    print(f"   Score: {score:g}% · Report: {REPORT_PATH}")
+    return score
+
+
+def write_report(
+    results: list[dict[str, Any]], server: str, llm: str, total_time: float, score: float
 ) -> None:
-    """Run the full adversarial testing pipeline.
-
-    Args:
-        count: Number of inputs per tool (LLM-generated).
-        tools: Specific tool names to test (None = all).
-        server_url: MCP server endpoint.
-    """
-    with open(CONFIG_PATH, "r") as f:
-        config = yaml.safe_load(f)
-
-    server_cfg = config["servers"].get(server_url.split("/")[-2] if "/" in server_url else server_url, {})
-    mcp_url = server_cfg.get("url", server_url)
-
-    print(f"🔍 Connecting to {mcp_url}...")
-    t_total = time.monotonic()
-
-    async with Client(mcp_url) as client:
-        # --- Phase 1: Discovery ---
-        print("📋 Phase 1: Discovering tools...")
-        tool_list = await client.list_tools()
-        schemas = {}
-        for t in tool_list:
-            if tools and t.name not in tools:
-                continue
-            schema = {
-                "name": t.name,
-                "description": getattr(t, "description", ""),
-            }
-            if hasattr(t, "inputSchema"):
-                schema["inputSchema"] = t.inputSchema
-            schemas[t.name] = schema
-
-        print(f"   Found {len(schemas)} tool(s) to attack")
-
-        # --- Phase 2: Generation (LLM + Fallback) ---
-        print(f"🧠 Phase 2: Generating adversarial inputs via {OLLAMA_MODEL} + fallback attacks...")
-        generated: dict[str, list[dict]] = {}
-        prompt = ATTACK_PROMPT.replace("{count}", str(count))
-
-        for i, (name, schema) in enumerate(schemas.items(), 1):
-            print(f"   [{i}/{len(schemas)}] {name}...", end=" ", flush=True)
-
-            # LLM generation
-            llm_cases: list[dict] = []
-            response = _ask_ollama(f"{prompt}\n{json.dumps(schema, indent=2)}")
-            llm_cases = _parse_json_array(response)
-
-            # Fallback attacks
-            fallback_cases = _FALLBACK_ATTACKS.get(name, [])
-
-            # Merge: LLM + fallback (deduplicate by params)
-            all_cases: list[dict] = []
-            seen_params: set[str] = set()
-
-            for case in fallback_cases + llm_cases:
-                params_key = json.dumps(case.get("params", {}), sort_keys=True)
-                if params_key not in seen_params:
-                    seen_params.add(params_key)
-                    all_cases.append(case)
-
-            generated[name] = all_cases if all_cases else [
-                {"why": "no attacks generated", "params": {}}
-            ]
-            print(f"{len(generated[name])} inputs (LLM: {len(llm_cases)}, fallback: {len(fallback_cases)})")
-
-        total_gen = sum(len(v) for v in generated.values())
-        if total_gen == 0:
-            print("❌ No attack cases generated. Check Ollama and fallback data.")
-            return
-
-        # --- Phase 3: Execution ---
-        print(f"⚔️  Phase 3: Executing {total_gen} adversarial inputs...")
-        results: list[dict] = []
-
-        for tool_name, cases in generated.items():
-            for case in cases:
-                params = case.get("params", {})
-                why = case.get("why", "no reason")
-
-                t1 = time.monotonic()
-                try:
-                    result = await client.call_tool(tool_name, params)
-                    content = getattr(result, "content", [])
-                    text = content[0].text if content and hasattr(content[0], "text") else str(result)
-                    elapsed = time.monotonic() - t1
-                    verdict = _classify(tool_name, params, text)
-                    results.append({
-                        "tool": tool_name, "why": why, "params": params,
-                        "verdict": verdict, "response": text[:200],
-                        "elapsed_ms": round(elapsed * 1000, 1),
-                    })
-                except Exception as e:
-                    elapsed = time.monotonic() - t1
-                    error_text = str(e)[:300]
-                    verdict = _classify_exception(tool_name, params, error_text)
-                    results.append({
-                        "tool": tool_name, "why": why, "params": params,
-                        "verdict": verdict, "error": error_text,
-                        "elapsed_ms": round(elapsed * 1000, 1),
-                    })
-
-        total_time = time.monotonic() - t_total
-
-        passed = sum(1 for r in results if r["verdict"] == "passed")
-        rejected = sum(1 for r in results if r["verdict"] == "rejected")
-        vulnerabilities = sum(1 for r in results if r["verdict"] == "vulnerability")
-        resistant = passed + rejected  # both are good — the server is healthy
-        score = round((resistant / len(results)) * 100, 1)
-
-        # --- Phase 4: Report ---
-        print(f"📊 Phase 4: Generating report...")
-        _write_report(results, len(schemas), total_time, score)
-        print(f"\n✅ Done!")
-        print(f"   Passed: {passed} | Rejected (defended): {rejected} | Vulnerabilities: {vulnerabilities}")
-        print(f"   Score: {score}% | Report: {REPORT_PATH}")
-
-
-def _write_report(
-    results: list[dict],
-    tools_count: int,
-    total_time: float,
-    score: float,
-) -> None:
-    """Write QA_REPORT.md with proper classification."""
-    passed = sum(1 for r in results if r["verdict"] == "passed")
-    rejected = sum(1 for r in results if r["verdict"] == "rejected")
-    vulnerabilities = sum(1 for r in results if r["verdict"] == "vulnerability")
+    """Write QA_REPORT.md."""
+    counts = {
+        v: sum(r["verdict"] == v for r in results)
+        for v in ("accepted", "rejected", "slow", "vulnerability")
+    }
     total = len(results)
-
     lines = [
-        "# Lupus QA Report",
+        "# 🐺 Lupus QA Report — adversarial run",
         "",
-        f"**Generated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
-        f"**Server:** Orion",
-        f"**LLM:** {OLLAMA_MODEL} (Ollama) + fallback attacks",
-        f"**Total time:** {total_time:.1f}s",
+        f"🕒 **Generated:** {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}  ",
+        f"🎯 **Server:** {server} (isolated instance)  ",
+        f"🧠 **LLM:** {llm}  ",
+        f"⏱️ **Total time:** {total_time:.1f}s",
         "",
-        "## Summary",
+        "## 📊 Summary",
         "",
-        "| Metric | Value |",
-        "|--------|-------|",
-        f"| Tests executed | {total} |",
-        f"| Passed | {passed} |",
-        f"| Rejected (defended) | {rejected} |",
-        f"| Vulnerabilities | {vulnerabilities} |",
-        f"| Score | {score}% |",
-        f"| Tools tested | {tools_count} |",
+        f"### {score_line(score)}",
         "",
-        "**Score = (passed + rejected) / total.** Rejections count as success — "
-        "they mean Orion correctly defended itself against malicious input.",
+        "```",
+        bar((total - counts["vulnerability"]) / total if total else 0.0),
+        "```",
+        "",
+        "| Verdict | Cases | Meaning |",
+        "|---------|-------|---------|",
+        f"| ✅ Accepted | `{counts['accepted']}` | Tool succeeded; hostile text stored verbatim |",
+        f"| 🛡️ Rejected | `{counts['rejected']}` | Tool error — invalid input refused |",
+        f"| 🐢 Slow | `{counts['slow']}` | Answered after more than {SLOW_SECONDS:g}s |",
+        f"| 🚨 Vulnerability | `{counts['vulnerability']}` | Crash, protocol failure, leak or "
+        "corruption |",
+        "",
+        "Score = cases without a vulnerability / total cases.",
         "",
     ]
 
-    if vulnerabilities:
-        lines.append(f"## Vulnerabilities ({vulnerabilities})")
-        lines.append("")
-        for r in results:
-            if r["verdict"] == "vulnerability":
-                lines.extend([
-                    f"### {r['tool']}",
-                    f"- **Why:** {r['why']}",
-                    f"- **Input:** `{json.dumps(r['params'])}`",
-                    f"- **Error:** {r.get('error', 'unknown')}",
-                    "",
-                ])
-    elif rejected > 0:
-        lines.append(f"## Rejections ({rejected})")
-        lines.append("")
-        lines.append("Every rejection below is Orion defending itself correctly — "
-                     "not a bug. These inputs were designed to break the server, "
-                     "and Orion refused them all.")
-        lines.append("")
-        lines.append("<details>")
-        lines.append("<summary>Click to expand rejection details</summary>")
-        lines.append("")
-        for r in results:
-            if r["verdict"] == "rejected":
-                lines.append(f"- **{r['tool']}** — {r.get('error', r.get('response', ''))[:120]}")
-        lines.append("")
-        lines.append("</details>")
+    findings = [r for r in results if r["verdict"] in ("vulnerability", "slow")]
+    if findings:
+        lines.extend(
+            [
+                "## 🚨 Findings",
+                "",
+                "| Tool | Attack | Verdict | Detail |",
+                "|------|--------|---------|--------|",
+            ]
+        )
+        for r in findings:
+            lines.append(f"| `{r['tool']}` | {r['why']} | {r['verdict']} | {r['reason'][:150]} |")
         lines.append("")
     else:
-        lines.append("## No vulnerabilities found")
-        lines.append("")
-        lines.append("Orion survived every adversarial input without issues.")
-        lines.append("")
+        lines.extend(["## ✅ No findings", "", "No crash, leak, corruption or slow response.", ""])
 
-    per_tool: dict[str, list[float]] = {}
-    for r in results:
-        per_tool.setdefault(r["tool"], []).append(r["elapsed_ms"])
-
-    lines.extend([
-        "## Response times",
-        "",
-        "| Tool | Avg | Min | Max | Calls |",
-        "|------|-----|-----|-----|-------|",
-    ])
-    for tool, times in sorted(per_tool.items()):
-        avg = sum(times) / len(times)
+    tools = sorted({r["tool"] for r in results})
+    lines.extend(
+        [
+            "## 🧰 Per tool",
+            "",
+            "| Tool | Accepted | Rejected | Slow | Vuln | Avg time |",
+            "|------|----------|----------|------|------|----------|",
+        ]
+    )
+    for tool in tools:
+        rows = [r for r in results if r["tool"] == tool]
+        avg = sum(r["elapsed_ms"] for r in rows) / len(rows)
+        tally = {v: sum(r["verdict"] == v for r in rows) for v in counts}
         lines.append(
-            f"| {tool} | {avg:.0f}ms | {min(times):.0f}ms "
-            f"| {max(times):.0f}ms | {len(times)} |"
+            f"| `{tool}` | {tally['accepted']} | {tally['rejected']} | {tally['slow']} "
+            f"| {tally['vulnerability']} | `{avg:.0f}ms` |"
         )
 
-    lines.extend([
-        "",
-        f"## Quality Score: {score}%",
-        "",
-        f"{'🟢 Production-ready' if score >= 95 else '🟡 Needs attention' if score >= 80 else '🔴 Requires fixes'}",
-        "",
-    ])
-
+    lines.extend(
+        [
+            "",
+            "<details><summary>All cases</summary>",
+            "",
+            "| Tool | Attack | Verdict | Detail |",
+            "|------|--------|---------|--------|",
+            *(
+                f"| `{r['tool']}` | {r['why'][:60]} | {r['verdict']} | "
+                f"{(r['reason'] or '—')[:80].replace('|', '/')} |"
+                for r in results
+            ),
+            "",
+            "</details>",
+            "",
+            "---",
+            "",
+            "*Generated by 🐺 Lupus — universo MCP test suite*",
+            "",
+        ]
+    )
     REPORT_PATH.write_text("\n".join(lines), encoding="utf-8")

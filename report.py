@@ -1,137 +1,145 @@
-"""Report generation module for Lupus test suite.
+"""Markdown dossier for a Lupus pytest run (TEST_REPORT.md).
 
-Generates a dossier with test results, timing, and layer breakdown.
-Called automatically at the end of each test run via pytest hook.
+Called automatically at the end of each run via the pytest hook in conftest.py.
+Shared rendering helpers (bar, score line) are also used by attacker.py.
 """
 
-from datetime import datetime, timezone
+from __future__ import annotations
+
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
-REPORT_DIR = Path(__file__).parent
-REPORT_PATH = REPORT_DIR / "TEST_REPORT.md"
+REPORT_PATH = Path(__file__).parent / "TEST_REPORT.md"
+
+LAYER_ICONS = {
+    "protocol": "🔌",
+    "functional": "⚙️",
+    "contracts": "📜",
+    "persistence": "💾",
+    "performance": "⚡",
+    "unknown": "❓",
+}
 
 
-def generate_report(
-    results: list[dict],
-    total_time: float,
-    llm_used: bool = False,
-) -> str:
-    """Generate a markdown test dossier from collected results.
+def bar(ratio: float, width: int = 20) -> str:
+    """Text progress bar, e.g. ``██████░░░░ 60%``."""
+    ratio = max(0.0, min(1.0, ratio))
+    filled = round(ratio * width)
+    return f"{'█' * filled}{'░' * (width - filled)} {ratio * 100:.0f}%"
+
+
+def score_line(score: float) -> str:
+    """Score heading with a traffic-light icon. Shows the real value, never rounded up."""
+    icon = "🟢" if score >= 95 else "🟡" if score >= 80 else "🔴"
+    return f"{icon} **{score:g}%**"
+
+
+def _short(nodeid: str) -> str:
+    return nodeid.split("::", 1)[-1]
+
+
+def generate_report(results: list[dict[str, Any]], total_time: float) -> str:
+    """Write the dossier and return its path.
 
     Args:
-        results: List of test result dicts with keys:
-            name, outcome, duration, layer, error (optional).
-        total_time: Total test suite execution time in seconds.
-        llm_used: Whether the LLM was active during the run.
-
-    Returns:
-        Path to the generated report file.
+        results: One dict per test with name, outcome, duration, layer, error.
+        total_time: Wall-clock duration of the run in seconds.
     """
-    passed = [r for r in results if r["outcome"] == "passed"]
-    failed = [r for r in results if r["outcome"] == "failed"]
-    skipped = [r for r in results if r["outcome"] == "skipped"]
-    errors = [r for r in results if r["outcome"] == "error"]
-    total = len(results)
-
-    # Group by layer
-    layers: dict[str, list[dict]] = {}
-    for r in results:
-        layer = r.get("layer", "unknown")
-        layers.setdefault(layer, []).append(r)
-
-    score = round((len(passed) / total) * 100, 1) if total > 0 else 0
-
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    by_outcome: dict[str, list[dict[str, Any]]] = {}
+    for result in results:
+        by_outcome.setdefault(result["outcome"], []).append(result)
+    passed = by_outcome.get("passed", [])
+    failed = by_outcome.get("failed", []) + by_outcome.get("error", [])
+    skipped = by_outcome.get("skipped", [])
+    executed = len(results) - len(skipped)
+    score = round(len(passed) / executed * 100, 1) if executed else 0.0
 
     lines = [
-        "# Lupus Test Dossier",
+        "# 🐺 Lupus Test Dossier",
         "",
-        f"**Generated:** {now}",
-        f"**Total time:** {total_time:.1f}s",
-        f"**LLM active:** {'Yes (qwen2.5:3b via Ollama)' if llm_used else 'No (fallback data)'}",
+        f"🕒 **Generated:** {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}  ",
+        f"⏱️ **Total time:** {total_time:.1f}s",
         "",
-        "## Summary",
+        "## 📊 Summary",
+        "",
+        f"### {score_line(score)}",
+        "",
+        "```",
+        bar(len(passed) / executed if executed else 0.0),
+        "```",
         "",
         "| Metric | Value |",
         "|--------|-------|",
-        f"| Total tests | {total} |",
-        f"| Passed | {len(passed)} |",
-        f"| Failed | {len(failed)} |",
-        f"| Skipped | {len(skipped)} |",
-        f"| Errors | {len(errors)} |",
-        f"| Score | {score}% |",
+        f"| 🧪 Executed | `{executed}` |",
+        f"| ✅ Passed | `{len(passed)}` |",
+        f"| ❌ Failed | `{len(by_outcome.get('failed', []))}` |",
+        f"| 💥 Errors (setup/teardown) | `{len(by_outcome.get('error', []))}` |",
+        f"| ⏭️ Skipped | `{len(skipped)}` |",
         "",
-        f"{'All tests passed.' if not failed else f'**{len(failed)} test(s) failed.**'}",
+        "Score = passed / executed. Skipped tests are excluded; errors count as failures.",
         "",
+        "## 🧱 Layers",
+        "",
+        "| Layer | Tests | Passed | Failed | Skipped | Time | Score |",
+        "|-------|-------|--------|--------|---------|------|-------|",
     ]
 
-    # Layer breakdown
-    lines.extend([
-        "## Layer Breakdown",
-        "",
-        "| Layer | Tests | Passed | Failed | Time |",
-        "|-------|-------|--------|--------|------|",
-    ])
-    for layer_name in sorted(layers.keys()):
-        layer_tests = layers[layer_name]
-        layer_passed = sum(1 for t in layer_tests if t["outcome"] == "passed")
-        layer_failed = sum(1 for t in layer_tests if t["outcome"] == "failed")
-        layer_time = sum(t.get("duration", 0) for t in layer_tests)
+    layers: dict[str, list[dict[str, Any]]] = {}
+    for result in results:
+        layers.setdefault(result.get("layer", "unknown"), []).append(result)
+    for name in sorted(layers):
+        tests = layers[name]
+        ok = sum(t["outcome"] == "passed" for t in tests)
+        bad = sum(t["outcome"] in ("failed", "error") for t in tests)
+        skip = sum(t["outcome"] == "skipped" for t in tests)
+        ran = len(tests) - skip
+        layer_score = f"{ok / ran * 100:.0f}%" if ran else "—"
+        seconds = sum(t.get("duration", 0.0) for t in tests)
         lines.append(
-            f"| {layer_name} | {len(layer_tests)} | {layer_passed} "
-            f"| {layer_failed} | {layer_time:.1f}s |"
+            f"| {LAYER_ICONS.get(name, '❓')} {name} | {len(tests)} | {ok} | {bad} | {skip} "
+            f"| `{seconds:.1f}s` | {layer_score} |"
         )
     lines.append("")
 
-    # Failed tests detail
     if failed:
-        lines.extend([
-            "## Failed Tests",
+        lines.extend(["## ❌ Failures", ""])
+        for test in failed:
+            lines.extend(
+                [
+                    f"### `{_short(test['name'])}` ({test['outcome']})",
+                    "",
+                    f"Layer: {test.get('layer', 'unknown')} · Duration: `{test['duration']:.2f}s`",
+                    "",
+                    "<details><summary>Details</summary>",
+                    "",
+                    "```",
+                    test.get("error", "")[:500],
+                    "```",
+                    "",
+                    "</details>",
+                    "",
+                ]
+            )
+
+    slowest = sorted(results, key=lambda r: r.get("duration", 0.0), reverse=True)[:5]
+    lines.extend(
+        [
+            "## 🐢 Slowest tests",
             "",
-        ])
-        for t in failed:
-            lines.extend([
-                f"### {t['name']}",
-                f"- **Layer:** {t.get('layer', 'unknown')}",
-                f"- **Duration:** {t.get('duration', 0):.2f}s",
-            ])
-            if t.get("error"):
-                lines.append(f"- **Error:** {t['error'][:500]}")
-            lines.append("")
+            "| # | Test | Layer | Duration |",
+            "|---|------|-------|----------|",
+            *(
+                f"| {i} | `{_short(t['name'])}` | {t.get('layer', '?')} | `{t['duration']:.2f}s` |"
+                for i, t in enumerate(slowest, 1)
+            ),
+            "",
+            "---",
+            "",
+            "*Generated by 🐺 Lupus — universo MCP test suite*",
+            "",
+        ]
+    )
 
-    # Slowest tests
-    sorted_by_time = sorted(results, key=lambda x: x.get("duration", 0), reverse=True)
-    slowest = sorted_by_time[:5]
-    lines.extend([
-        "## Slowest Tests",
-        "",
-        "| Test | Layer | Duration |",
-        "|------|-------|----------|",
-    ])
-    for t in slowest:
-        lines.append(
-            f"| {t['name']} | {t.get('layer', '?')} | {t.get('duration', 0):.2f}s |"
-        )
-    lines.append("")
-
-    # Timing per layer
-    lines.extend([
-        "## Performance Summary",
-        "",
-        f"- **Total suite time:** {total_time:.1f}s",
-        f"- **Average per test:** {total_time / total:.2f}s" if total > 0 else "",
-        f"- **Fastest:** {sorted_by_time[-1].get('duration', 0):.2f}s ({sorted_by_time[-1]['name']})" if sorted_by_time else "",
-        f"- **Slowest:** {slowest[0].get('duration', 0):.2f}s ({slowest[0]['name']})" if slowest else "",
-        "",
-    ])
-
-    # Footer
-    lines.extend([
-        "---",
-        "",
-        f"*Generated by Lupus — universo MCP test suite*",
-    ])
-
-    report_content = "\n".join(lines)
-    REPORT_PATH.write_text(report_content, encoding="utf-8")
+    REPORT_PATH.write_text("\n".join(lines), encoding="utf-8")
     return str(REPORT_PATH)

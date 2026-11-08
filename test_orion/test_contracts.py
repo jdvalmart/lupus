@@ -1,114 +1,133 @@
-"""Layer 3 — Contract & Edge Case Tests.
+"""Layer 3 — contracts: invalid, hostile and edge-case input is rejected or stored safely."""
 
-Tests that Orion handles invalid, unexpected, or malicious inputs
-without crashing or leaking information.
-
-Uses local LLM (Ollama) to generate edge cases via ollama fixture.
-"""
+from __future__ import annotations
 
 import pytest
 
+pytestmark = [pytest.mark.contracts, pytest.mark.usefixtures("requires_managed")]
 
-@pytest.mark.contracts
+
 class TestNonExistentIDs:
-    """Operations on IDs that don't exist should fail gracefully."""
+    """Operations on missing ids fail as tool errors, not fake successes."""
 
-    async def test_revise_nonexistent(self, mcp_client, call):
-        r = await call("revise_decision", {
-            "id": 99999,
-            "topic": "ghost",
-        })
-        assert "not found" in r.lower()
+    @pytest.mark.parametrize("memory_id", [99_999_999, 0, -1])
+    async def test_forget_unknown_id(self, call, memory_id):
+        assert "not found" in await call.error("forget_decision", {"id": memory_id})
 
-    async def test_forget_nonexistent(self, mcp_client, call):
-        r = await call("forget_decision", {"id": 99999})
-        assert "not found" in r.lower()
-
-    async def test_find_related_nonexistent(self, mcp_client, call):
-        r = await call("find_related", {"id": 99999})
-        assert "no relationships" in r.lower() or "not found" in r.lower()
-
-
-@pytest.mark.contracts
-class TestEmptyAndSpecialInputs:
-    """Empty strings, weird characters, and edge values."""
-
-    async def test_empty_topic(self, mcp_client, call):
-        """Empty topic should still store."""
-        r = await call("remember_decision", {
-            "topic": "",
-            "decision": "empty topic test",
-        })
-        assert "Stored decision" in r
-
-    async def test_empty_query(self, mcp_client, call):
-        """Empty query should not crash."""
-        r = await call("recall_context", {"query": ""})
-        assert isinstance(r, str)
-
-    async def test_special_characters(self, mcp_client, call, ollama):
-        """Special characters in topic and decision are handled.
-
-        Uses LLM to generate realistic Unicode/emoji test strings.
-        """
-        unicode_str = ollama(
-            "Generate a string with emojis and special Unicode characters for testing. "
-            "Include at least 3 emojis and accented letters. Only the string, nothing else.",
-            timeout=10,
+    async def test_revise_unknown_id(self, call):
+        assert "not found" in await call.error(
+            "revise_decision", {"id": 99_999_999, "topic": "ghost"}
         )
-        if not unicode_str or "OLLAMA_ERROR" in unicode_str:
-            unicode_str = "emoji 🔥 test unicode ñ á é í ó ú — em dash – bullet •"
 
-        r = await call("remember_decision", {
-            "topic": unicode_str[:50],
-            "decision": unicode_str,
-            "tags": "unicode,llm,test",
-        })
-        assert "Stored decision" in r
+    async def test_find_related_unknown_id(self, call):
+        assert "not found" in await call.error("find_related", {"id": 99_999_999})
 
-        recall = await call("recall_context", {
-            "query": unicode_str[:30],
-        })
-        assert isinstance(recall, str)
-
-    async def test_very_long_input(self, mcp_client, call, ollama):
-        """Very long decision text should not break storage.
-
-        Uses LLM to generate a long technical text.
-        """
-        long_text = ollama(
-            "Write a detailed 500-word technical explanation of how distributed databases work. "
-            "Only the text, no headings or formatting.",
-            timeout=15,
+    async def test_link_to_unknown_id(self, call, project):
+        stored = await call.ok(
+            "remember_decision", {"topic": "a", "decision": "a", "project": project}
         )
-        if not long_text or "OLLAMA_ERROR" in long_text or len(long_text) < 100:
-            long_text = "x" * 5000
+        assert "not found" in await call.error(
+            "link_concepts",
+            {"source_id": stored["id"], "target_id": 99_999_999, "relation": "depends_on"},
+        )
 
-        r = await call("remember_decision", {
-            "topic": "long_input_llm",
-            "decision": long_text[:5000],
-        })
-        assert "Stored decision" in r
+    async def test_session_with_unknown_decision(self, call, project):
+        await call.error(
+            "remember_session",
+            {"summary": "x", "decisions_made": [99_999_999], "project": project},
+        )
 
 
-@pytest.mark.contracts
-class TestZeroAndNegativeValues:
-    """Numeric edge cases."""
+class TestInvalidInput:
+    """Schema and domain validation."""
 
-    async def test_zero_id(self, mcp_client, call):
-        """ID 0 should not exist."""
-        r = await call("forget_decision", {"id": 0})
-        assert "not found" in r.lower()
+    @pytest.mark.parametrize(
+        "args",
+        [
+            {"topic": "", "decision": "empty topic"},
+            {"topic": "t", "decision": ""},
+            {"topic": "   ", "decision": "blank topic"},
+            {"topic": "t" * 201, "decision": "topic over the limit"},
+            {"topic": "t", "decision": "d" * 20_001},
+            {"decision": "missing topic"},
+        ],
+        ids=[
+            "empty-topic",
+            "empty-decision",
+            "blank-topic",
+            "long-topic",
+            "long-decision",
+            "missing-topic",
+        ],
+    )
+    async def test_remember_rejects(self, call, project, args):
+        await call.error("remember_decision", {**args, "project": project})
 
-    async def test_negative_id(self, mcp_client, call):
-        """Negative IDs should not exist."""
-        r = await call("forget_decision", {"id": -1})
-        assert "not found" in r.lower()
+    @pytest.mark.parametrize(
+        "args",
+        [
+            {"query": ""},
+            {"query": "?!"},
+            {"query": "test", "limit": 0},
+            {"query": "test", "limit": 51},
+            {"query": "test", "limit": "abc"},
+            {"query": "test", "scope": "everything"},
+        ],
+        ids=["empty", "no-words", "limit-0", "limit-51", "limit-string", "bad-scope"],
+    )
+    async def test_recall_rejects(self, call, project, args):
+        await call.error("recall_context", {**args, "project": project})
 
-    async def test_recall_zero_limit(self, mcp_client, call):
-        """Limit 0 should not crash."""
-        r = await call("recall_context", {
-            "query": "test",
-            "limit": 0,
-        })
-        assert isinstance(r, str)
+    async def test_string_id_is_rejected(self, call):
+        await call.error("forget_decision", {"id": "abc"})
+
+    async def test_invalid_project_name_is_rejected(self, call):
+        await call.error("remember_decision", {"topic": "t", "decision": "d", "project": "///"})
+
+    async def test_empty_summary_is_rejected(self, call, project):
+        await call.error("remember_session", {"summary": "  ", "project": project})
+
+    async def test_oversized_profile_section_is_rejected(self, call):
+        """whoami returns the whole profile; an unbounded section would flood the context."""
+        await call.error("update_profile", {"section": "huge", "value": "x" * 100_000})
+
+
+class TestHostileContent:
+    """Hostile strings are stored verbatim and never alter the store."""
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "'; DROP TABLE memories; --",
+            "../../etc/passwd",
+            "<script>alert(1)</script>",
+            "‮؜‎test‏",
+            "emoji 🔥 ñ á é — •",
+            '{"key": "val"}',
+            'unbalanced " quote * NEAR( OR AND',
+        ],
+        ids=["sql", "path", "xss", "bidi", "unicode", "json", "fts-syntax"],
+    )
+    async def test_stored_verbatim_and_searchable(self, call, project, text):
+        stored = await call.ok(
+            "remember_decision", {"topic": "hostile", "decision": text, "project": project}
+        )
+        assert stored["decision"] == text.strip()
+        await call.ok("recall_context", {"query": f"hostile {text}", "project": project})
+        health = await call.ok("orion_health")
+        assert health["integrity"] == "ok"
+
+    async def test_null_byte_does_not_corrupt_store(self, call, project):
+        result = await call.raw(
+            "remember_decision", {"topic": "nul", "decision": "a\x00b", "project": project}
+        )
+        if not result.is_error:
+            assert result.structured_content["decision"] == "a\x00b"
+        assert (await call.ok("orion_health"))["integrity"] == "ok"
+
+    async def test_hostile_project_name_is_normalised(self, call):
+        stored = await call.ok(
+            "remember_decision", {"topic": "t", "decision": "d", "project": "../../Etc/Passwd"}
+        )
+        assert "/" not in stored["project"]
+        assert stored["project"] == stored["project"].lower()

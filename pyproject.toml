@@ -1,29 +1,43 @@
 [project]
 name = "lupus"
-version = "0.1.0"
-description = "Test suite for the universo MCP ecosystem — protocol, functional, contracts, persistence, and performance testing."
+version = "0.2.0"
+description = "Test suite for the universo MCP ecosystem — protocol, functional, contracts, persistence, performance and adversarial testing."
 requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=3.4,<5",
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.6"]
 
 [project.scripts]
 lupus = "lupus_cli:main"
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.0.0",
-    "pytest-asyncio>=0.24.0",
-    "fastmcp>=2.0.0",
-    "pyyaml>=6.0",
-    "pydantic>=2.0.0",
-]
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["lupus_cli", "lupus_server", "attacker", "report", "conftest"]
 
 [tool.pytest.ini_options]
-# Look for tests in all test_* directories and test_shared/
-testpaths = ["."]
+testpaths = ["test_orion", "test_shared"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 markers = [
-    "protocol: MCP protocol compliance tests",
-    "functional: Tool functionality tests",
-    "contracts: Edge case and invalid input tests",
-    "persistence: File corruption and recovery tests",
-    "performance: Load, concurrency, and response time tests",
+    "protocol: MCP protocol compliance and transport security",
+    "functional: every tool does what it claims",
+    "contracts: invalid, hostile and edge-case input",
+    "persistence: restarts and concurrent clients",
+    "performance: latency and throughput budgets",
 ]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]

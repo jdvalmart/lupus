@@ -1,39 +1,71 @@
-"""Layer 4 — Persistence & Recovery Tests.
+"""Layer 4 — persistence: data survives restarts and concurrent clients lose nothing."""
 
-Tests that Orion handles data correctly across calls.
+from __future__ import annotations
 
-Uses local LLM (Ollama) to generate realistic test data via llm_data fixture.
-"""
+import asyncio
 
 import pytest
+from fastmcp import Client
+
+from conftest import Caller
+
+pytestmark = [pytest.mark.persistence, pytest.mark.usefixtures("requires_managed")]
 
 
-@pytest.mark.persistence
-class TestDataIntegrity:
-    """Data survives across tool calls and server remains consistent."""
+async def test_data_survives_restart(server, project):
+    async with Client(server.url, auth=server.token) as client:
+        call = Caller(client)
+        kept = await call.ok(
+            "remember_decision", {"topic": "durable", "decision": "survives", "project": project}
+        )
+        gone = await call.ok(
+            "remember_decision", {"topic": "deleted", "decision": "gone", "project": project}
+        )
+        await call.ok("forget_decision", {"id": gone["id"]})
+        await call.ok("remember_session", {"summary": "before restart", "project": project})
 
-    async def test_empty_state_is_graceful(self, mcp_client, call):
-        """Empty state returns friendly messages, not crashes."""
-        r = await call("browse_memories")
-        assert isinstance(r, str)
+    server.restart()
 
-    async def test_data_persists_across_calls(self, mcp_client, call, llm_data):
-        """Data written in one call is readable in subsequent calls."""
-        topic = llm_data("a topic about data persistence patterns")
-        decision = llm_data("a decision about using a specific persistence strategy")
+    async with Client(server.url, auth=server.token) as client:
+        call = Caller(client)
+        page = await call.ok("browse_memories", {"project": project})
+        assert [item["id"] for item in page["items"]] == [kept["id"]]
+        context = await call.ok("recall_session", {"project": project})
+        assert context["recent_sessions"][0]["summary"] == "before restart"
+        fresh = await call.ok(
+            "remember_decision", {"topic": "after", "decision": "restart", "project": project}
+        )
+        assert fresh["id"] > gone["id"]
+        assert (await call.ok("orion_health"))["integrity"] == "ok"
 
-        await call("remember_decision", {
-            "topic": topic,
-            "decision": decision,
-            "tags": "persistence,llm",
-        })
-        r = await call("recall_context", {
-            "query": "persistence patterns",
-        })
-        assert isinstance(r, str)
 
-    async def test_recall_works_after_restart(self, mcp_client, call):
-        """Data survives the full session (tested by running after
-        test_data_persists_across_calls)."""
-        browse = await call("browse_memories")
-        assert isinstance(browse, str)
+async def test_concurrent_clients_do_not_lose_writes(server, project):
+    clients, writes = 5, 20
+
+    async def writer(index: int) -> list[int]:
+        async with Client(server.url, auth=server.token) as client:
+            call = Caller(client)
+            ids = []
+            for n in range(writes):
+                stored = await call.ok(
+                    "remember_decision",
+                    {"topic": f"c{index}-{n}", "decision": "parallel", "project": project},
+                )
+                ids.append(stored["id"])
+            return ids
+
+    results = await asyncio.gather(*(writer(i) for i in range(clients)))
+    all_ids = [i for ids in results for i in ids]
+    assert len(set(all_ids)) == clients * writes
+
+    async with Client(server.url, auth=server.token) as client:
+        page = await Caller(client).ok("browse_memories", {"project": project, "limit": 100})
+        assert page["total"] == clients * writes
+
+
+async def test_empty_project_is_graceful(call, project):
+    context = await call.ok("recall_session", {"project": project})
+    assert context["total_sessions"] == 0
+    assert context["recent_sessions"] == []
+    page = await call.ok("browse_memories", {"project": project})
+    assert page == {"project": project, "total": 0, "offset": 0, "items": []}

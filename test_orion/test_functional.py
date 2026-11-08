@@ -1,176 +1,197 @@
-"""Layer 2 — Functional Tests.
+"""Layer 2 — every tool does what it claims, checked on structured output."""
 
-Tests that each Orion tool does what it claims via a real MCP session.
-Uses fastmcp.Client for proper Streamable HTTP negotiation.
-
-Uses local LLM (Ollama) to generate realistic test data via llm_data fixture.
-"""
-
-import time
+from __future__ import annotations
 
 import pytest
 
+pytestmark = [pytest.mark.functional, pytest.mark.usefixtures("requires_managed")]
 
-@pytest.mark.functional
+
+async def remember(call, project: str, topic: str, decision: str, **extra) -> dict:
+    return await call.ok(
+        "remember_decision", {"topic": topic, "decision": decision, "project": project, **extra}
+    )
+
+
 class TestMemoryCRUD:
     """Create, read, update, delete — full cycle."""
 
-    async def test_remember_and_browse(self, mcp_client, call, llm_data):
-        """Storing a decision shows up in browse."""
-        topic = llm_data("a software architecture topic like 'database choice' or 'API design'")
-        decision = llm_data("a short technical decision about that topic")
+    async def test_remember_returns_stored_entry(self, call, project):
+        stored = await remember(call, project, "database", "SQLite in WAL mode", tags=["Storage"])
+        assert stored["id"] > 0
+        assert stored["project"] == project
+        assert stored["topic"] == "database"
+        assert stored["tags"] == ["storage"]
 
-        r = await call("remember_decision", {
-            "topic": topic,
-            "decision": decision,
-            "tags": "test,lupus,llm",
-        })
-        assert "Stored decision" in r
+    async def test_browse_lists_newest_first(self, call, project):
+        first = await remember(call, project, "first", "one")
+        second = await remember(call, project, "second", "two")
+        page = await call.ok("browse_memories", {"project": project})
+        assert page["total"] == 2
+        assert [item["id"] for item in page["items"]] == [second["id"], first["id"]]
 
-        browse = await call("browse_memories")
-        assert topic in browse
+    async def test_recall_finds_matching_entry(self, call, project):
+        target = await remember(call, project, "payments", "Wompi handles card checkout")
+        await remember(call, project, "styling", "Tailwind with a warm palette")
+        found = await call.ok("recall_context", {"query": "wompi checkout", "project": project})
+        assert found["results"][0]["id"] == target["id"]
+        assert found["results"][0]["match"] in ("keyword", "both")
 
-    async def test_recall_finds_entry(self, mcp_client, call, llm_data):
-        """Semantic search finds relevant entries."""
-        topic = llm_data("a topic about machine learning or AI")
-        decision = llm_data("a decision about using a specific ML framework")
+    async def test_revise_changes_only_given_fields(self, call, project):
+        stored = await remember(call, project, "auth", "Cookies", tags=["security"])
+        revised = await call.ok("revise_decision", {"id": stored["id"], "decision": "JWT"})
+        assert revised["decision"] == "JWT"
+        assert revised["topic"] == "auth"
+        assert revised["tags"] == ["security"]
 
-        await call("remember_decision", {
-            "topic": topic,
-            "decision": decision,
-            "tags": "test,llm,recall",
-        })
+    async def test_forget_removes_from_browse_and_search(self, call, project):
+        stored = await remember(call, project, "cache", "Redis for sessions")
+        await call.ok("forget_decision", {"id": stored["id"]})
+        page = await call.ok("browse_memories", {"project": project})
+        assert page["total"] == 0
+        found = await call.ok("recall_context", {"query": "redis", "project": project})
+        assert found["results"] == []
 
-        query = llm_data("a search query to find the decision about ML frameworks")
-        result = await call("recall_context", {
-            "query": query,
-            "limit": 3,
-        })
-        assert isinstance(result, str)
+    async def test_ids_are_not_reused_after_forget(self, call, project):
+        first = await remember(call, project, "a", "a")
+        await call.ok("forget_decision", {"id": first["id"]})
+        second = await remember(call, project, "b", "b")
+        assert second["id"] > first["id"]
 
-    async def test_revise_updates_entry(self, mcp_client, call, llm_data):
-        """Revising changes the topic."""
-        original_topic = llm_data("a topic about deployment strategy")
-        new_topic = llm_data("a new topic about container orchestration")
 
-        c = await call("remember_decision", {
-            "topic": original_topic,
-            "decision": "deployment strategy to revise",
-        })
-        cid = int(c.split("#")[1].split(":")[0])
+class TestProjects:
+    """Memories are scoped to projects."""
 
-        r = await call("revise_decision", {
-            "id": cid,
-            "topic": new_topic,
-        })
-        assert "Revised decision" in r or new_topic in r
+    async def test_search_is_scoped_to_project(self, call, project):
+        other = f"{project}-other"
+        await remember(call, project, "queue", "Celery workers")
+        await remember(call, other, "queue", "RQ workers")
+        scoped = await call.ok("recall_context", {"query": "workers", "project": project})
+        assert {hit["project"] for hit in scoped["results"]} == {project}
+        everywhere = await call.ok("recall_context", {"query": "workers", "scope": "all"})
+        assert {project, other} <= {hit["project"] for hit in everywhere["results"]}
 
-        browse = await call("browse_memories")
-        assert new_topic in browse
+    async def test_list_projects_reports_counts(self, call, project):
+        await remember(call, project, "t", "d")
+        projects = await call.ok("list_projects")
+        mine = next(p for p in projects if p["name"] == project)
+        assert mine["memories"] == 1
 
-    async def test_forget_removes_entry(self, mcp_client, call, llm_data):
-        """Forgetting removes from browse."""
-        topic = llm_data(
-            "a unique topic about testing strategy",
-            fallback=f"forget_target_{int(time.time()*1000)}",
+
+class TestKnowledgeGraph:
+    """Graph tools: link, find, browse, cascade."""
+
+    async def test_link_and_find_both_directions(self, call, project):
+        a = await remember(call, project, "auth-service", "Issues tokens")
+        b = await remember(call, project, "payment-service", "Charges cards")
+        edge = await call.ok(
+            "link_concepts",
+            {"source_id": b["id"], "target_id": a["id"], "relation": "depends_on"},
+        )
+        assert edge["relation"] == "depends_on"
+
+        outgoing = await call.ok("find_related", {"id": b["id"]})
+        assert outgoing["links"] == [
+            {
+                "id": a["id"],
+                "topic": "auth-service",
+                "relation": "depends_on",
+                "direction": "outgoing",
+                "description": None,
+            }
+        ]
+        incoming = await call.ok("find_related", {"id": a["id"]})
+        assert incoming["links"][0]["direction"] == "incoming"
+
+    async def test_browse_graph_lists_project_edges(self, call, project):
+        a = await remember(call, project, "a", "a")
+        b = await remember(call, project, "b", "b")
+        await call.ok(
+            "link_concepts", {"source_id": a["id"], "target_id": b["id"], "relation": "relates_to"}
+        )
+        graph = await call.ok("browse_graph", {"project": project})
+        assert graph["total"] == 1
+
+    async def test_forget_cascades_to_edges(self, call, project):
+        a = await remember(call, project, "a", "a")
+        b = await remember(call, project, "b", "b")
+        await call.ok(
+            "link_concepts", {"source_id": a["id"], "target_id": b["id"], "relation": "relates_to"}
+        )
+        await call.ok("forget_decision", {"id": b["id"]})
+        assert (await call.ok("find_related", {"id": a["id"]}))["links"] == []
+
+    async def test_supersedes_links_new_to_old(self, call, project):
+        old = await remember(call, project, "orm", "Raw SQL")
+        new = await remember(call, project, "orm", "SQLAlchemy", supersedes=old["id"])
+        related = await call.ok("find_related", {"id": new["id"]})
+        assert (related["links"][0]["id"], related["links"][0]["relation"]) == (
+            old["id"],
+            "supersedes",
         )
 
-        c = await call("remember_decision", {
-            "topic": topic,
-            "decision": "testing strategy to delete",
-        })
-        cid = int(c.split("#")[1].split(":")[0])
+    async def test_invalid_relation_is_rejected(self, call, project):
+        a = await remember(call, project, "a", "a")
+        b = await remember(call, project, "b", "b")
+        await call.error(
+            "link_concepts", {"source_id": a["id"], "target_id": b["id"], "relation": "eats_pizza"}
+        )
 
-        r = await call("forget_decision", {"id": cid})
-        assert "Forgot decision" in r
-
-        browse = await call("browse_memories")
-        assert topic not in browse
-
-
-@pytest.mark.functional
-class TestKnowledgeGraph:
-    """Graph tools: link, find, browse."""
-
-    async def test_link_and_find(self, mcp_client, call, llm_data):
-        """Linking two nodes makes find_related work."""
-        desc_a = llm_data("a description of a microservice like 'user authentication service'")
-        desc_b = llm_data("a description of a dependent service like 'payment processing service'")
-
-        a = await call("remember_decision", {
-            "topic": "graph_node_a", "decision": desc_a,
-        })
-        aid = int(a.split("#")[1].split(":")[0])
-        b = await call("remember_decision", {
-            "topic": "graph_node_b", "decision": desc_b,
-        })
-        bid = int(b.split("#")[1].split(":")[0])
-
-        relation_desc = llm_data("a short description of the dependency between the two services")
-
-        r = await call("link_concepts", {
-            "source_id": aid,
-            "target_id": bid,
-            "relation": "depends_on",
-            "description": relation_desc,
-        })
-        assert "Linked" in r or "already" in r.lower()
-
-        find = await call("find_related", {"id": aid})
-        assert "depends_on" in find
-
-    async def test_browse_graph(self, mcp_client, call):
-        """Browse shows edges."""
-        graph = await call("browse_graph")
-        assert "depends_on" in graph or "relationship" in graph.lower()
-
-    async def test_invalid_relation_rejected(self, mcp_client, call):
-        """Invalid relation type returns an error message."""
-        r = await call("link_concepts", {
-            "source_id": 2,
-            "target_id": 3,
-            "relation": "eats_pizza",
-        })
-        assert "Invalid relation type" in r
-
-    async def test_self_link_rejected(self, mcp_client, call):
-        """Cannot link a node to itself."""
-        r = await call("link_concepts", {
-            "source_id": 2,
-            "target_id": 2,
-            "relation": "depends_on",
-        })
-        assert "Cannot link" in r
+    async def test_self_link_is_rejected(self, call, project):
+        a = await remember(call, project, "a", "a")
+        message = await call.error(
+            "link_concepts", {"source_id": a["id"], "target_id": a["id"], "relation": "depends_on"}
+        )
+        assert "itself" in message
 
 
-@pytest.mark.functional
-class TestWhoami:
-    """Profile tool."""
-
-    async def test_whoami_returns_profile(self, mcp_client, call):
-        """whoami returns Juan's data."""
-        result = await call("whoami")
-        assert "Juan David" in result or "Trajectory" in result
-
-
-@pytest.mark.functional
 class TestSessions:
-    """Session memory tools."""
+    """Session history and project state."""
 
-    async def test_remember_and_recall(self, mcp_client, call, llm_data):
-        """Session cycle: remember → recall contains the summary."""
-        summary = llm_data("a short summary of a development session about fixing bugs")
+    async def test_session_cycle_restores_context(self, call, project):
+        decision = await remember(call, project, "api", "REST")
+        await call.ok(
+            "remember_session",
+            {"summary": "Scaffolded the repo", "phase": "Phase 0", "project": project},
+        )
+        await call.ok(
+            "remember_session",
+            {
+                "summary": "Built the API",
+                "next_steps": "Write the frontend",
+                "decisions_made": [decision["id"]],
+                "project": project,
+            },
+        )
+        context = await call.ok("recall_session", {"project": project})
+        assert context["phase"] == "Phase 0"
+        assert context["next_steps"] == "Write the frontend"
+        assert context["total_sessions"] == 2
+        assert [s["summary"] for s in context["recent_sessions"]] == [
+            "Built the API",
+            "Scaffolded the repo",
+        ]
+        assert context["recent_decisions"][0]["id"] == decision["id"]
 
-        r = await call("remember_session", {
-            "summary": summary,
-            "tags": "test,lupus,llm",
-        })
-        assert "Saved session" in r
+    async def test_browse_sessions_pages(self, call, project):
+        for index in range(3):
+            await call.ok("remember_session", {"summary": f"s{index}", "project": project})
+        page = await call.ok("browse_sessions", {"project": project, "limit": 2})
+        assert page["total"] == 3
+        assert [s["summary"] for s in page["items"]] == ["s2", "s1"]
 
-        recall = await call("recall_session")
-        assert summary in recall
 
-    async def test_browse_sessions(self, mcp_client, call):
-        """Browse shows recorded sessions."""
-        browse = await call("browse_sessions")
-        assert "session" in browse.lower()
+class TestProfileAndHealth:
+    """Profile sections and diagnostics."""
+
+    async def test_update_profile_round_trip(self, call):
+        await call.ok("update_profile", {"section": "lupus_probe", "value": {"ok": True}})
+        profile = await call.ok("whoami")
+        assert profile["lupus_probe"] == {"ok": True}
+        await call.ok("update_profile", {"section": "lupus_probe", "value": None})
+        assert "lupus_probe" not in await call.ok("whoami")
+
+    async def test_health_reports_integrity(self, call):
+        health = await call.ok("orion_health")
+        assert health["integrity"] == "ok"
+        assert health["schema_version"] >= 1

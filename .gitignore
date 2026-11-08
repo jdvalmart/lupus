@@ -9,8 +9,11 @@ venv/
 .vscode/
 .idea/
 
-# Generated report
+# Generated reports
 QA_REPORT.md
+TEST_REPORT.md
+.pytest_cache/
+.ruff_cache/
 
 # OS
 .DS_Store

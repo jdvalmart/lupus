@@ -1,25 +1,43 @@
 # Lupus — Server Registry
 #
-# Each server under test needs a name, transport URL, and its expected
-# tool names. Lupus uses this to auto-discover what to test.
+# Managed servers (with `command`) are launched by Lupus for every run with a
+# fresh temporary data directory (`data_env`), a random bearer token
+# (`token_env`) and a free port appended as `<port_arg> <port>`. Tests and
+# attacks never touch real data.
 #
-# The `tools` list is optional. If present, Lupus validates that every
-# listed tool exists. If absent, Lupus skips the tool-existence check
-# for that server but still runs protocol and compliance tests.
+# External servers (only `url`) are tested as-is; set `token_from` to the name
+# of an environment variable holding their bearer token. Only run read-only
+# layers (protocol) against an external server you care about.
+#
+# `tools` lists the tools that must exist; the compliance layer checks them.
 
 servers:
   orion:
-    url: "http://localhost:9099/mcp"
+    command: ["../orion/.venv/bin/orion", "--transport", "http"]
+    port_arg: "--port"
+    data_env: ORION_DATA_DIR
+    token_env: ORION_TOKEN
+    env:
+      ORION_SEMANTIC: "off"
+      ORION_LOG_LEVEL: "WARNING"
     tools:
       - remember_decision
       - recall_context
       - revise_decision
       - forget_decision
       - browse_memories
-      - whoami
       - link_concepts
       - find_related
       - browse_graph
       - remember_session
       - recall_session
       - browse_sessions
+      - list_projects
+      - whoami
+      - update_profile
+      - orion_health
+
+  # Example of an already-running server:
+  # orion-live:
+  #   url: "http://127.0.0.1:9099/mcp"
+  #   token_from: ORION_TOKEN

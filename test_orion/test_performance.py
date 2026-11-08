@@ -1,70 +1,66 @@
-"""Layer 5 — Performance & Load Tests.
+"""Layer 5 — performance: latency stays low with a realistic amount of data.
 
-Tests that Orion responds within acceptable time limits.
-
-Uses local LLM (Ollama) to generate diverse test data via llm_data fixture.
+Budgets are deliberately generous; they catch order-of-magnitude
+regressions, not milliseconds.
 """
 
+from __future__ import annotations
+
+import statistics
 import time
 
 import pytest
 
+pytestmark = [pytest.mark.performance, pytest.mark.usefixtures("requires_managed")]
 
-@pytest.mark.performance
-class TestResponseTime:
-    """Tools must respond within acceptable time limits."""
-
-    async def test_whoami_response_time(self, mcp_client, call):
-        """whoami should respond in under 1s."""
-        start = time.monotonic()
-        r = await call("whoami")
-        elapsed = time.monotonic() - start
-        assert "Trajectory" in r
-        assert elapsed < 2.0, f"whoami took {elapsed:.2f}s"
-
-    async def test_recall_response_time(self, mcp_client, call):
-        """recall_context should respond in under 2s."""
-        start = time.monotonic()
-        await call("recall_context", {"query": "test"})
-        elapsed = time.monotonic() - start
-        assert elapsed < 3.0, f"recall took {elapsed:.2f}s"
-
-    async def test_browse_response_time(self, mcp_client, call):
-        """browse_memories should respond quickly."""
-        start = time.monotonic()
-        await call("browse_memories")
-        elapsed = time.monotonic() - start
-        assert elapsed < 1.0, f"browse took {elapsed:.2f}s"
+SEED = 200
 
 
-@pytest.mark.performance
-class TestBulkOperations:
-    """Orion handles multiple operations without degrading."""
+@pytest.fixture
+async def seeded(call, project) -> str:
+    for index in range(SEED):
+        await call.ok(
+            "remember_decision",
+            {
+                "topic": f"topic-{index}",
+                "decision": f"Decision {index} about service {index % 17} and cache layer",
+                "tags": [f"group-{index % 5}"],
+                "project": project,
+            },
+        )
+    return project
 
-    async def test_bulk_remember(self, mcp_client, call, llm_data):
-        """Write 30 decisions with LLM-generated data and verify they exist."""
-        start = time.monotonic()
-        for i in range(30):
-            topic = llm_data(f"topic #{i+1} for a software architecture decision", fallback=f"bulk_topic_{i}")
-            decision = llm_data(f"technical decision about {topic}", fallback=f"bulk entry number {i}")
-            await call("remember_decision", {
-                "topic": topic,
-                "decision": decision,
-                "tags": "bulk,performance,llm",
-            })
-        elapsed = time.monotonic() - start
-        assert elapsed < 30.0, f"30 LLM-generated writes took {elapsed:.2f}s"
 
-        browse = await call("browse_memories")
-        assert "bulk" in browse
+async def _p95(call, name: str, args: dict, runs: int = 20) -> float:
+    timings = []
+    for _ in range(runs):
+        start = time.perf_counter()
+        await call.ok(name, args)
+        timings.append(time.perf_counter() - start)
+    return statistics.quantiles(timings, n=20)[18]
 
-    async def test_recall_with_many_entries(self, mcp_client, call):
-        """Semantic search should still work with many entries."""
-        start = time.monotonic()
-        r = await call("recall_context", {
-            "query": "bulk entry",
-            "limit": 3,
-        })
-        elapsed = time.monotonic() - start
-        assert elapsed < 5.0, f"recall with bulk data took {elapsed:.2f}s"
-        assert isinstance(r, str)
+
+async def test_bulk_writes_throughput(call, project):
+    start = time.perf_counter()
+    for index in range(100):
+        await call.ok(
+            "remember_decision", {"topic": f"bulk-{index}", "decision": "x", "project": project}
+        )
+    elapsed = time.perf_counter() - start
+    assert elapsed < 20.0, f"100 writes took {elapsed:.1f}s"
+
+
+@pytest.mark.parametrize(
+    ("tool", "args", "budget"),
+    [
+        ("recall_context", {"query": "service cache"}, 0.5),
+        ("browse_memories", {"limit": 50}, 0.5),
+        ("recall_session", {}, 0.5),
+        ("whoami", {}, 0.5),
+    ],
+)
+async def test_p95_latency(call, seeded, tool, args, budget):
+    if tool != "whoami":
+        args = {**args, "project": seeded}
+    p95 = await _p95(call, tool, args)
+    assert p95 < budget, f"{tool} p95 {p95 * 1000:.0f}ms over {budget * 1000:.0f}ms"

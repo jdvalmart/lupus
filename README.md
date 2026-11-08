@@ -5,264 +5,135 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.11+-blue.svg?logo=python&logoColor=white" alt="Python">
   <img src="https://img.shields.io/badge/pytest-8+-0A9EDC.svg?logo=pytest&logoColor=white" alt="Pytest">
-  <img src="https://img.shields.io/badge/tests-36_green-green.svg" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-66-green.svg" alt="Tests">
   <img src="https://img.shields.io/badge/layers-5-purple.svg" alt="Layers">
-  <img src="https://img.shields.io/badge/llm-llama3.2-orange.svg?logo=ollama&logoColor=white" alt="Llama">
-  <img src="https://img.shields.io/badge/orion_score-100%25-brightgreen.svg" alt="Orion">
+  <img src="https://img.shields.io/badge/llm-optional_(Ollama)-orange.svg?logo=ollama&logoColor=white" alt="LLM">
   <img src="https://img.shields.io/badge/license-MIT-lightgrey.svg" alt="License">
 </p>
 
 ---
 
-<br>
-
 Test suite for the **universo** MCP ecosystem. Validates servers at the protocol,
-functional, contract, persistence, and performance level — plus AI-powered
-adversarial testing via local LLM.
+functional, contract, persistence and performance level, plus adversarial testing
+with a built-in attack corpus and an optional local LLM.
 
- <br>
+**Lupus never touches real data.** For every run it launches its own instance of the
+server under test with a temporary data directory, a random bearer token and a free
+port, and deletes everything afterwards.
 
-|  Protocol |  Functional |  Contracts |  Persistence |  Performance |  AI Attack |
+| 🔌 Protocol | ⚙️ Functional | 📜 Contracts | 💾 Persistence | ⚡ Performance | 🐺 Attack |
 |:---:|:---:|:---:|:---:|:---:|:---:|
-| 7 tests | 13 tests | 10 tests | 3 tests | 5 tests | llama3.2 |
+| JSON-RPC, auth | every tool | invalid & hostile input | restarts, concurrency | p95 latency | crashes, leaks, corruption |
 
-<br>
-
----
-
-```mermaid
-graph TD
-    subgraph Lupus["Lupus"]
-        CLI["  CLI<br/>run · attack · report"]
-
-        subgraph Layers["  5 Test Layers"]
-            P["  Protocol"]
-            F["  Functional"]
-            C["  Contracts"]
-            PE["  Persistence"]
-            PF["  Performance"]
-        end
-
-        AI["  AI Adversarial<br/>llama3.2 via Ollama"]
-    end
-
-    subgraph Targets["  Targets"]
-        O["  Orion :9099"]
-        V["  Vela"]
-        D["  Draco"]
-    end
-
-    REP["  QA_REPORT.md"]
-
-    CLI --> Layers
-    CLI --> AI
-    Layers --> O
-    Layers -.-> V
-    Layers -.-> D
-    AI --> O
-    Layers --> REP
-    AI --> REP
-```
-
-##   Quick start
+## Quick start
 
 ```bash
-# Clone & install
-git clone https://github.com/jdvalmart/lupus && cd lupus
-python -m venv .venv && source .venv/bin/activate
-pip install pytest pytest-asyncio fastmcp pyyaml pydantic
+# Orion must be installed next to Lupus (../orion/.venv/bin/orion)
+cd ~/Proyectos/universo/lupus
+uv venv && uv pip install -e '.[dev]'
 
-# Make sure Orion is running
-systemctl --user start orion
-
-# Run the suite
-python lupus_cli.py run -v
-
-# AI-powered attack (needs Ollama)
-ollama pull llama3.2
-python lupus_cli.py attack
+.venv/bin/python lupus_cli.py run -q          # all layers (~20 s)
+.venv/bin/python lupus_cli.py attack          # adversarial run (Ollama optional)
+.venv/bin/python lupus_cli.py report          # latest TEST_REPORT.md
+.venv/bin/python lupus_cli.py report --qa     # latest QA_REPORT.md
 ```
 
-##   CLI commands
+`./run_tests.sh` wraps the same commands (`--layer`, `--attack`, `--report`).
+
+## CLI
 
 ```bash
-python lupus_cli.py run                    #   All 5 layers (36 tests)
-python lupus_cli.py run --layer contracts  #   Single layer
-python lupus_cli.py run -v -x              #   Verbose, stop on first failure
-
-python lupus_cli.py attack                 #   AI adversarial (all 12 tools)
-python lupus_cli.py attack --count 10      #   10 inputs per tool
-python lupus_cli.py attack --tools recall  #   Specific tools only
-
-python lupus_cli.py report                 #   Latest QA_REPORT.md
+lupus run                          # all 5 layers
+lupus run --layer contracts        # one or more layers, comma-separated
+lupus run -v -x                    # verbose, stop on first failure
+lupus attack                       # corpus + LLM cases for every tool
+lupus attack --tools recall_context,update_profile --count 8
+lupus report [--qa]
 ```
 
-##   Getting started (step by step)
+`lupus attack` exits with status 1 when it finds a vulnerability, so it can gate CI.
 
-###  Prerequisites
+## Test layers
 
-| Requirement | How to check |
-|-------------|--------------|
-| Python 3.11+ | `python --version` |
-| Orion running | `systemctl --user status orion` |
-| Ollama (optional) | `ollama list` |
+| # | Layer | Mark | What it proves |
+|---|-------|------|----------------|
+| 1 | 🔌 Protocol | `protocol` | Valid JSON-RPC errors, standard codes, bearer token enforced (401), tool metadata |
+| 2 | ⚙️ Functional | `functional` | CRUD, search, project scoping, graph and cascades, sessions, profile, health |
+| 3 | 📜 Contracts | `contracts` | Unknown ids are tool errors, schema limits, hostile strings stored verbatim |
+| 4 | 💾 Persistence | `persistence` | Data survives a server restart; 5 concurrent clients lose no write |
+| 5 | ⚡ Performance | `performance` | 100 writes < 20 s; p95 < 500 ms for search, browse, recall, whoami on 200 entries |
 
-###  1. Clone and install
+Tests are deterministic: each one works in its own randomly named project and
+asserts on structured output, never on prose.
 
-```bash
-cd ~/Documentos/GitHub/universo
-git clone https://github.com/jdvalmart/lupus
-cd lupus
-python -m venv .venv
-source .venv/bin/activate
-pip install pytest pytest-asyncio fastmcp pyyaml pydantic
-```
-
-###  2. Verify Orion is reachable
-
-```bash
-curl -s http://localhost:9099/mcp -X POST \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | head -c 100
-```
-
-###  3. Run the standard suite
-
-```bash
-python lupus_cli.py run -v
-# Expected: 36 passed in ~15s
-```
-
-###  4. Run an adversarial attack (optional)
-
-```bash
-# Terminal 1: ollama serve
-# Terminal 2:
-python lupus_cli.py attack --tools whoami,recall_context --count 3
-```
-
-###  5. View the quality report
-
-```bash
-python lupus_cli.py report
-# Or: cat QA_REPORT.md
-```
-
-###  Common issues
-
-|  Problem |  Solution |
-|---------|----------|
-| `Connection refused` | Start Orion: `systemctl --user start orion` |
-| `Missing session ID` | Orion must run HTTP mode: `python server.py --transport http` |
-| `Ollama not running` | `ollama serve` in another terminal |
-| `Module not found` | `source .venv/bin/activate` |
-| `No QA report found` | Run `python lupus_cli.py attack` first |
-
-##   Test layers
-
-```mermaid
-graph BT
-    subgraph "  5 — Performance"
-        T5[" response time · 30 bulk writes"]
-    end
-    subgraph "  4 — Persistence"
-        T4[" cross-call data · empty state"]
-    end
-    subgraph "  3 — Contracts"
-        T3[" invalid IDs · Unicode · type confusion"]
-    end
-    subgraph "  2 — Functional"
-        T2[" CRUD cycle · graph links · sessions"]
-    end
-    subgraph "  1 — Protocol"
-        T1[" JSON-RPC · tools/list · error codes"]
-    end
-    T5 --> T4 --> T3 --> T2 --> T1
-```
-
-|  # |  Layer |  Mark |  Tests | What it validates |
-|---|-------|------|-------|-------------------|
-| 1 |  Protocol | `protocol` | 7 | JSON-RPC compliance, error codes, session negotiation |
-| 2 |  Functional | `functional` | 13 | Every tool works — CRUD, graph, sessions, whoami |
-| 3 |  Contracts | `contracts` | 10 | Non-existent IDs, empty strings, Unicode, boundary values |
-| 4 |  Persistence | `persistence` | 3 | Data survives across calls, graceful empty state |
-| 5 |  Performance | `performance` | 5 | Response times <1s, bulk writes scale linearly |
-| — |  AI Adversarial | — | N | llama3.2 generates malicious inputs, attacker classifies |
-
-##   Adversarial testing
-
-`lupus attack` uses **llama3.2** to generate malicious inputs for every tool,
-executes them, and produces `QA_REPORT.md`.
+## Adversarial testing
 
 ```mermaid
 sequenceDiagram
-    participant L as  Lupus
-    participant O as  Ollama
-    participant S as  Orion
+    participant L as Lupus
+    participant S as Isolated server
+    participant O as Ollama (optional)
 
-    L->>S:  tools/list
-    S-->>L:  12 tool schemas
-
-    loop  For each tool
-        L->>O:  "Generate adversarial inputs"
-        O-->>L:  JSON with malicious params
+    L->>S: start (temp data, token, free port)
+    L->>S: tools/list
+    opt Ollama reachable
+        L->>O: generate hostile inputs per tool schema
     end
-
-    loop  For each input
-        L->>S:  Execute with adversarial params
-        S-->>L:  Response or validation error
-        L->>L:  Classify verdict
+    loop corpus + LLM cases
+        L->>S: tools/call
+        L->>L: classify (and restart the server if it crashed)
     end
-
-    L->>L:  Generate QA_REPORT.md
+    L->>S: orion_health (integrity)
+    L->>L: QA_REPORT.md, then delete the instance
 ```
 
-###  Verdict classification
-
-|  Verdict |  Meaning |
+| Verdict | Meaning |
 |---------|---------|
-| `passed` |  Input accepted, output correct |
-| `rejected` |  Invalid input correctly refused — **defense, not a bug** |
-| `vulnerability` |  Crash, data leak, or unexpected behavior |
+| ✅ accepted | Tool succeeded — hostile text stored verbatim is fine |
+| 🛡️ rejected | Tool error — invalid input refused |
+| 🐢 slow | Answered after more than 3 s (warning) |
+| 🚨 vulnerability | Server crash, transport/protocol failure, leaked internals (tracebacks, paths, SQL errors) or failed integrity check |
 
-> **Score = (passed + rejected) / total.** A server that rejects every malicious
-> input without crashing scores 100%.
+**Score = cases without a vulnerability / total.** Model and endpoint:
+`LUPUS_OLLAMA_MODEL` (default `llama3.2`), `LUPUS_OLLAMA_URL`.
 
-##   Configuration
+## Configuration
 
 ```yaml
-# config.yaml — add any MCP server
+# config.yaml
 servers:
   orion:
-    url: "http://localhost:9099/mcp"
-    tools:
-      - remember_decision
-      - recall_context
-      # ...
+    command: ["../orion/.venv/bin/orion", "--transport", "http"]
+    port_arg: "--port"           # Lupus appends: --port <free port>
+    data_env: ORION_DATA_DIR      # receives a fresh temp dir
+    token_env: ORION_TOKEN        # receives a random token
+    env: { ORION_SEMANTIC: "off" }
+    tools: [remember_decision, recall_context, ...]
+
+  orion-live:                     # external server: only read-only layers run
+    url: "http://127.0.0.1:9099/mcp"
+    token_from: ORION_TOKEN
 ```
 
-##   Structure
+Tests that write data skip themselves on external servers, and `lupus attack`
+refuses to run against one.
+
+## Structure
 
 ```
 lupus/
-├── lupus_cli.py            #   CLI entrypoint
-├── attacker.py             #   adversarial engine
-├── conftest.py             #   MCP client + Ollama fixtures
-├── config.yaml             #   server registry
-├── pyproject.toml          #   pytest configuration
-├── test_orion/
-│   ├── test_protocol.py    #   layer 1
-│   ├── test_functional.py  #   layer 2
-│   ├── test_contracts.py   #   layer 3
-│   ├── test_persistence.py #   layer 4
-│   └── test_performance.py #   layer 5
-├── test_shared/
-│   └── test_mcp_compliance.py
-├── docs/assets/logo.svg    #   wolf logo
-├── QA_REPORT.md            #   generated   (gitignored)
-└── README.md
+├── lupus_cli.py         # CLI: run · attack · report
+├── lupus_server.py      # launches isolated server instances
+├── attacker.py          # adversarial engine
+├── report.py            # TEST_REPORT.md + shared rendering
+├── conftest.py          # fixtures, call helpers, report hooks
+├── config.yaml          # server registry
+├── test_orion/          # layers 1–5 for Orion
+├── test_shared/         # compliance checks for any MCP server
+└── docs/assets/logo.svg
 ```
+
+Generated reports (`TEST_REPORT.md`, `QA_REPORT.md`) are git-ignored.
 
 ---
 
